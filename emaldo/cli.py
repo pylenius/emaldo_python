@@ -1409,6 +1409,105 @@ def cmd_third_party_pv(args):
         sys.exit(1)
 
 
+def cmd_sell_limit(args):
+    """Handle the 'sell-limit' subcommand (selling protection 0x5E/0x5F)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    # ── Read current state ────────────────────────────────────────
+    if args.read or (not args.on and not args.off):
+        print("Reading selling-protection state (0x5F)…")
+        try:
+            data = client.get_selling_protection(home_id, device_id, model, log=e2e_log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        on = data["selling_protection_on"]
+        threshold_kwh = data["threshold_kwh"]
+        print(f"  Selling protection (export cap): {'ON' if on else 'OFF'}")
+        print(f"  Threshold: {threshold_kwh} kWh/day")
+        return
+
+    # ── Write ────────────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    threshold_kwh = args.threshold if args.threshold is not None else 0
+    label = "ON" if enabled else "OFF"
+    print(f"Setting selling protection {label}, threshold={threshold_kwh} kWh/day…")
+    try:
+        ok = client.set_selling_protection(
+            home_id, device_id, model, enabled, threshold_kwh, log=e2e_log,
+        )
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"Selling protection set to {label}.")
+    else:
+        print("Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_sell_back_to_grid(args):
+    """Handle the 'sell-back-to-grid' subcommand (VPP 0x05/0x06)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    # ── Read current state ────────────────────────────────────────
+    if args.read or (not args.on and not args.off):
+        print("Reading sell-back-to-grid (VPP) state (0x06)…")
+        try:
+            data = client.get_virtualpowerplant(home_id, device_id, model, log=e2e_log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        on = data["sell_back_to_grid_on"]
+        print(f"  Sell Back to Grid: {'ON' if on else 'OFF'}")
+        return
+
+    # ── Write ────────────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    label = "ON" if enabled else "OFF"
+    print(f"Setting sell-back-to-grid {label}…")
+    try:
+        ok = client.set_virtualpowerplant(home_id, device_id, model, enabled, log=e2e_log)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"Sell-back-to-grid set to {label}.")
+    else:
+        print("Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_peak_shaving(args):
     """Handle the 'peak-shaving' subcommand."""
     client = load_client(args)
@@ -1694,6 +1793,18 @@ Examples:
     p_tp.add_argument("--on", action="store_true", default=False, help="Enable third-party PV")
     p_tp.add_argument("--off", action="store_true", default=False, help="Disable third-party PV")
 
+    p_sl = sub.add_parser("sell-limit", help="Read/write selling-protection state (0x5E/0x5F) via E2E")
+    p_sl.add_argument("--read", action="store_true", help="Read current state (default when no --on/--off)")
+    p_sl.add_argument("--on", action="store_true", default=False, help="Enable selling protection (cap/block export)")
+    p_sl.add_argument("--off", action="store_true", default=False, help="Disable selling protection (allow export)")
+    p_sl.add_argument("--threshold", type=int, metavar="KWH", default=None,
+                      help="Export threshold in kWh/day (used with --on, default 0, max 300)")
+
+    p_sbtg = sub.add_parser("sell-back-to-grid", help="Read/write sell-back-to-grid VPP state (0x05/0x06) via E2E")
+    p_sbtg.add_argument("--read", action="store_true", help="Read current state (default when no --on/--off)")
+    p_sbtg.add_argument("--on", action="store_true", default=False, help="Enable sell-back-to-grid")
+    p_sbtg.add_argument("--off", action="store_true", default=False, help="Disable sell-back-to-grid")
+
     p_ps = sub.add_parser("peak-shaving", help="Peak shaving config & schedule via E2E")
     p_ps.add_argument("--show", action="store_true", help="Show current peak shaving state (default)")
     p_ps.add_argument("--enable", action="store_true", help="Enable peak shaving")
@@ -1739,6 +1850,8 @@ Examples:
         "strategy": cmd_strategy, "sell": cmd_sell,
         "emergency-charge": cmd_emergency_charge, "override": cmd_override,
         "third-party-pv": cmd_third_party_pv,
+        "sell-limit": cmd_sell_limit,
+        "sell-back-to-grid": cmd_sell_back_to_grid,
         "peak-shaving": cmd_peak_shaving,
         "balancing-state": cmd_balancing_state,
         "region": cmd_region, "contract": cmd_contract, "features": cmd_features,

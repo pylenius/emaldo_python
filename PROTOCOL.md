@@ -155,7 +155,9 @@ All packets in a session share the same nonce (except alive packets which genera
 | Type | Mode | Direction | Payload | Response |
 |------|------|-----------|---------|----------|
 | `0x01` | `0xA0` | Write | `[on u8, start u32le, end u32le]` 9B (zeros=cancel) | ACK 161B |
+| `0x05` | `0xA0` | Write | `[on u8, len u8, user_id utf8]` | set_virtualpowerplant – Sell Back to Grid (fire-and-forget; user_id required for auth) |
 | `0x06` | `0x10` | Read | `[cabinet_idx u8]` 1B | Battery info ≥80B |
+| `0x06` | `0xA0` | Subscribe | (empty) | get_virtualpowerplant – sell-back state 1B |
 | `0x1A` | `0xA0` | Write | Override payload (see §4.7) | ACK 161B |
 | `0x1B` | `0xA0` | Subscribe | (empty) | Override state (see §7.2) |
 | `0x20` | `0xA0` | Subscribe | (empty) | EV charging mode 6B |
@@ -170,6 +172,8 @@ All packets in a session share the same nonce (except alive packets which genera
 | `0x5A` | `0xA0` | Write | Peak schedule 15B+ | ACK |
 | `0x5B` | `0xA0` | Subscribe | (empty) | Peak shaving config 20B |
 | `0x5C` | `0xA0` | Subscribe | (empty) | Peak schedule 28B |
+| `0x5E` | `0xA0` | Write | `[on u8, threshold u32le]` 5B | set_sellingprotection – Sell Limit cap in kWh/day (fire-and-forget) |
+| `0x5F` | `0xA0` | Subscribe | (empty) | get_sellingprotection – selling protection state 6B |
 | `0x77` | `0xA0` | Write | `[redundancy u8]` 1B | ACK |
 | `0x80` | `0xA0` | Write | `[on u8, target u32le, expand u8]` 6B | ACK |
 | `0x81` | `0xA0` | Subscribe | `b""` | Manual selling state 10B |
@@ -277,6 +281,32 @@ All payloads are little-endian unless noted.
 | 3–4 | `u16` | `fixed_full_kwh` | kWh slider max |
 | 5 | `u8` | `price_percent` | (semantics unknown) |
 
+### 7.9 Sell Back to Grid / VPP state (`0x06` mode `0xA0`, 1 byte)
+
+The opcode `0x06` is reused: with mode `0x10` it reads battery info (see §7.3);
+with mode `0xA0` it subscribes to the sell-back-to-grid (Virtual Power Plant) state.
+
+| Offset | Type | Field | Notes |
+|--------|------|-------|-------|
+| 0 | `u8` | `sell_back_to_grid_on` | 1 = sell-back enabled, 0 = disabled |
+
+### 7.10 Selling Protection state (`0x5F`, 6 bytes)
+
+Response payload for `get_sellingprotection` (opcode `0x5F`, mode `0xA0`).
+
+| Offset | Type | Field | Notes |
+|--------|------|-------|-------|
+| 0 | `u8` | `status` | Always 0x00 (firstUse/status byte) |
+| 1 | `u8` | `selling_protection_on` | 1 = export capped/blocked, 0 = allowed |
+| 2–5 | `u32le` | `threshold_kwh` | Daily export cap in kWh/day (0 = no cap) |
+
+The write command (`0x5E`) payload format is **different** — it does **not** include the leading status byte:
+
+```
+byte 0:   on              (1=enable protection, 0=disable)
+bytes 1–4: threshold_kwh  (LE u32; daily kWh cap; 0 = safe default)
+```
+
 ---
 
 ## 8. Override Slot Values
@@ -345,6 +375,30 @@ Default window when enabling: now → top-of-current-hour + 48h.
 byte 0:   on              (1=enable, 0=disable)
 bytes 1–4: target_kwh     (LE u32; integer kWh)
 byte 5:   expand          (1=expand selling, 0=no)
+```
+
+### `0x05` set_virtualpowerplant (variable length)
+
+Enables or disables "Sell Back to Grid" (Virtual Power Plant feature).
+The device firmware requires the account `user_id` for authorisation; without it
+the command is silently ignored.
+
+```
+byte 0:    on             (1=enable, 0=disable)
+byte 1:    len            (length of user_id in bytes)
+bytes 2+:  user_id        (UTF-8 encoded account user_id)
+```
+
+When `user_id` is empty, send only `[on(1B)]` as a fallback (device may reject it).
+
+### `0x5E` set_sellingprotection (5 bytes)
+
+Enables or disables the daily grid-export cap ("Sell Limit").
+This is a fire-and-forget command; the device does **not** send a response payload.
+
+```
+byte 0:    on             (1=enable cap, 0=disable cap)
+bytes 1–4: threshold_kwh  (LE u32; daily export cap in kWh/day; 0 = safe default)
 ```
 
 ---
@@ -418,7 +472,7 @@ Hardcoded in APK, extracted via `emaldo/extract_keys.py`:
 
 - **Credential freshness**: Always call `e2e_login()` fresh; never re-use cached E2E credentials from a previous session. The relay validates credentials and returns 212B if they are stale.
 - **Command timing**: Wait ≥200ms after heartbeat before sending commands, or the relay may reject them.
-- **Fire-and-forget**: Commands like `0x41` (third-party PV) have `setIsNeedResult=false` in the APK — they send no application-level response payload. Only a relay ACK (~161B) is returned.
+- **Fire-and-forget**: Commands like `0x41` (third-party PV), `0x05` (sell-back-to-grid), and `0x5E` (sell limit) have `setIsNeedResult=false` in the APK — they send no application-level response payload. Only a relay ACK (~161B) is returned.
 - **State lag**: After a write command, wait ≥1–2s before reading back state via a subscribe command — the device takes time to apply changes.
 - **Multiple responses**: Subscribe commands (`0xA0` mode) may return multiple UDP packets. The first is often a relay echo/ACK; the actual data arrives in a subsequent packet.
 - **Battery probing**: Send one `0x06` request per cabinet index (0, 1, 2, …); stop after two consecutive short (<250B) or missing responses.

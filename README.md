@@ -29,6 +29,9 @@ this implementation.
 - **Emergency charge** — Force-charge the battery via E2E
 - **Peak shaving** — Full peak shaving control via E2E (toggle, reserves, schedule, all-day, redundancy)
 - **Grid frequency regulation** — Read FCR/mFRR balancing state via E2E
+- **Third-party PV control** — Enable/disable third-party PV routing via E2E
+- **Sell Back to Grid** — Enable/disable VPP grid export via E2E (`set_virtualpowerplant` 0x05)
+- **Sell Limit** — Read/write daily grid-export cap in kWh/day via E2E (`set_sellingprotection` 0x5E)
 - **Usage analytics** — Solar, grid, battery, and revenue data
 
 ## Installation
@@ -170,6 +173,21 @@ emaldo peak-shaving --schedule 06:00-22:00 5000 Mon-Fri --all-day  # All-day mod
 emaldo peak-shaving --no-all-day                                 # Disable all-day
 emaldo peak-shaving --redundancy 1                               # Set redundancy
 
+# Third-party PV
+emaldo third-party-pv --on
+emaldo third-party-pv --off
+
+# Sell Back to Grid (VPP – requires account user_id for auth)
+emaldo sell-back-to-grid               # Read current state
+emaldo sell-back-to-grid --on
+emaldo sell-back-to-grid --off
+
+# Sell Limit (daily grid-export cap)
+emaldo sell-limit                      # Read current state (on/off + kWh/day threshold)
+emaldo sell-limit --on --threshold 300 # Enable with 300 kWh/day cap
+emaldo sell-limit --on --threshold 50  # Enable with 50 kWh/day cap
+emaldo sell-limit --off                # Disable (threshold is remembered by device)
+
 # Grid frequency regulation (balancing) state
 emaldo balancing-state                  # Show current state (idle/pre_balancing/fcr_n/fcr_d_up/fcr_d_down/fcr_d_up_down/mfrr_up/mfrr_down/balancing_failed)
 emaldo balancing-state --json           # Raw JSON output
@@ -281,6 +299,11 @@ client = EmaldoClient(session=session)
 | `set_peak_shaving_schedule(home_id, ..., id, start, end, days, power, all_day)` | Set peak shaving schedule |
 | `set_peak_shaving_redundancy(home_id, ..., redundancy)` | Set redundancy value |
 | `get_regulate_frequency_state(home_id, device_id, model)` | Read grid frequency regulation (balancing) state via E2E |
+| `set_third_party_pv(home_id, device_id, model, enabled)` | Enable/disable third-party PV routing (0x41) |
+| `set_selling_protection(home_id, device_id, model, enabled, threshold_kwh)` | Enable/disable daily export cap; threshold in kWh/day (0x5E) |
+| `get_selling_protection(home_id, device_id, model)` | Read selling-protection state: `{selling_protection_on, threshold_kwh}` (0x5F) |
+| `set_virtualpowerplant(home_id, device_id, model, enabled)` | Enable/disable sell-back-to-grid (0x05); sends user_id for auth |
+| `get_virtualpowerplant(home_id, device_id, model)` | Read sell-back-to-grid state: `{sell_back_to_grid_on}` (0x06) |
 | `get_region(home_id, device_id, model)` | Device region info |
 | `get_contract(home_id)` | Balance contract info |
 | `get_features(home_id, device_id, model)` | Device feature flags |
@@ -335,6 +358,9 @@ The 7 standard override actions map to slot values using the configured markers 
 | `override` | Override control (`--show`, `--reset`, `--range`, `--markers`) |
 | `sell` | Sell (discharge-to-grid) via E2E (`--hours`, `--until`, `--cancel`) |
 | `emergency-charge` | Emergency charge via E2E (`--hours`, `--until`, `--cancel`) |
+| `third-party-pv` | Enable/disable third-party PV routing via E2E (`--on`, `--off`) |
+| `sell-back-to-grid` | Read/write sell-back-to-grid (VPP) state via E2E (`--read`, `--on`, `--off`) |
+| `sell-limit` | Read/write daily export cap via E2E (`--read`, `--on`, `--off`, `--threshold KWH`) |
 | `peak-shaving` | Peak shaving via E2E (`--show`, `--enable`, `--disable`, `--peak-reserve`, `--ups-reserve`, `--schedule`, `--all-day`, `--no-all-day`, `--redundancy`) |
 | `balancing-state` | Grid frequency regulation (balancing) state via E2E (`--json`, `--verbose`) |
 | `region` | Region info |

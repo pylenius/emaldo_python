@@ -714,6 +714,8 @@ class EmaldoClient:
             "home_end_secret": home_data.get("end_secret", ""),
             "home_chat_secret": home_data.get("chat_secret", ""),
             "host": device_e2e.get("host", f"{DEFAULT_E2E_HOST}:{DEFAULT_E2E_PORT}"),
+            # Required for set_virtualpowerplant (0x05) user authorisation
+            "user_id": self._session.get("user_id", "") if self._session else "",
         }
 
     def get_overrides(
@@ -1027,3 +1029,55 @@ class EmaldoClient:
         """Enable or disable third-party PV input."""
         creds = self.e2e_login(home_id, device_id, model)
         return _e2e.set_thirdparty_pv(creds, enabled, log=log)
+
+    def set_selling_protection(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        enabled: bool,
+        threshold_w: int = 0,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Enable/disable selling protection (grid-export cap, 0x5E)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.set_selling_protection(creds, enabled, threshold_w, log=log)
+
+    def get_selling_protection(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read selling-protection state (0x5F)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.get_selling_protection(creds, log=log)
+
+    def set_virtualpowerplant(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        enabled: bool,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Set sell-back-to-grid (VPP) state (0x05). Sends user_id for auth."""
+        creds = self.e2e_login(home_id, device_id, model)
+        user_id = creds.get("user_id", "")
+        return _e2e.set_virtualpowerplant(creds, enabled, user_id=user_id, log=log)
+
+    def get_virtualpowerplant(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read sell-back-to-grid state (0x06)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.get_virtualpowerplant(creds, log=log)
