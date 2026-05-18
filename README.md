@@ -158,10 +158,16 @@ emaldo sell --hours 2
 emaldo sell --until 18:00
 emaldo sell --cancel
 
-# Emergency charge for 1 hour
+# Emergency charge for 1 hour (starts immediately)
 emaldo emergency-charge --hours 1
 emaldo emergency-charge --until 06:00
 emaldo emergency-charge --cancel
+
+# Emergency charge with explicit start/end window
+emaldo emergency-charge --start 23:00 --until 06:00
+emaldo emergency-charge --start 02:00 --hours 4
+emaldo emergency-charge --start "2026-05-20 23:00" --until "2026-05-21 06:00"
+emaldo emergency-charge --start 23:00 --until 06:00 --dry-run
 
 # Peak shaving
 emaldo peak-shaving                                              # Show current state
@@ -291,7 +297,8 @@ client = EmaldoClient(session=session)
 | `reset_overrides(home_id, ..., high_marker, low_marker)` | Clear overrides (optionally set markers) |
 | `send_sell(home_id, device_id, model, duration_seconds)` | Sell (discharge-to-grid) for N seconds |
 | `cancel_sell(home_id, device_id, model)` | Cancel active sell command |
-| `emergency_charge_on(home_id, device_id, model, duration_seconds)` | Emergency charge for N seconds |
+| `emergency_charge_on(home_id, device_id, model, duration_seconds)` | Emergency charge for N seconds (starts immediately) |
+| `emergency_charge_window(home_id, device_id, model, start_unix, end_unix)` | Emergency charge for an explicit time window (Unix timestamps) |
 | `emergency_charge_off(home_id, device_id, model)` | Cancel emergency charge |
 | `get_peak_shaving(home_id, device_id, model)` | Read peak shaving config & schedule via E2E |
 | `toggle_peak_shaving(home_id, ..., enabled)` | Enable/disable peak shaving |

@@ -1001,7 +1001,86 @@ def cmd_sell(args):
 
 def cmd_emergency_charge(args):
     """Handle the 'emergency-charge' subcommand."""
-    _cmd_manual_control(args, command_name="emergency-charge")
+    # --cancel and duration-only flows reuse the shared implementation.
+    if args.cancel or not getattr(args, "start", None):
+        _cmd_manual_control(args, command_name="emergency-charge")
+        return
+
+    # -- Explicit time-window flow (--start + --until / --hours) ------
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    try:
+        s = args.start
+        if len(s) <= 5:  # HH:MM
+            parts = s.split(":")
+            start_dt = now.replace(hour=int(parts[0]), minute=int(parts[1]),
+                                   second=0, microsecond=0)
+            if start_dt <= now:
+                start_dt += timedelta(days=1)
+        else:
+            start_dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
+    except (ValueError, IndexError):
+        print(f"Error: cannot parse start time '{args.start}'. "
+              "Use HH:MM or YYYY-MM-DD HH:MM", file=sys.stderr)
+        sys.exit(1)
+
+    end_dt = None
+    if args.until:
+        try:
+            u = args.until
+            if len(u) <= 5:  # HH:MM
+                parts = u.split(":")
+                end_dt = start_dt.replace(hour=int(parts[0]), minute=int(parts[1]),
+                                          second=0, microsecond=0)
+                if end_dt <= start_dt:
+                    end_dt += timedelta(days=1)
+            else:
+                end_dt = datetime.strptime(u, "%Y-%m-%d %H:%M")
+        except (ValueError, IndexError):
+            print(f"Error: cannot parse end time '{args.until}'. "
+                  "Use HH:MM or YYYY-MM-DD HH:MM", file=sys.stderr)
+            sys.exit(1)
+    elif args.hours:
+        end_dt = start_dt + timedelta(hours=args.hours)
+    else:
+        print("Error: --start requires --until or --hours to define the end of the window.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if end_dt <= start_dt:
+        print("Error: end time must be after start time.", file=sys.stderr)
+        sys.exit(1)
+
+    start_unix = int(start_dt.timestamp())
+    end_unix = int(end_dt.timestamp())
+    print(f"Emergency charge from {start_dt.strftime('%Y-%m-%d %H:%M')} "
+          f"to {end_dt.strftime('%Y-%m-%d %H:%M')}")
+
+    if args.dry_run:
+        print("  [Dry run - not sending]")
+        return
+
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    verbose = getattr(args, "verbose", False)
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+    log = e2e_log if verbose else None
+
+    try:
+        success = client.emergency_charge_window(
+            home_id, device_id, model, start_unix, end_unix, log=log,
+        )
+        if success:
+            print("  Emergency charge window set successfully!")
+        else:
+            print("  Command sent but no acknowledgement received.", file=sys.stderr)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_override(args):
@@ -1768,15 +1847,22 @@ Examples:
 
     sub.add_parser("strategy", help="AI mode strategy (FCR + schedule + revenue)")
 
-    # sell and emergency-charge use the same E2E protocol (type 0x01)
+    # sell and emergency-charge use the same E2E protocol (type 0x01);
+    # emergency-charge additionally supports an explicit start-time window.
+    _mc_parsers: dict = {}
     for cmd_name, cmd_help in [("sell", "Sell (discharge-to-grid) via E2E"),
                                 ("emergency-charge", "Emergency charge via E2E")]:
         p_mc = sub.add_parser(cmd_name, help=cmd_help)
+        _mc_parsers[cmd_name] = p_mc
         p_mc.add_argument("--hours", type=float, help="Duration in hours (decimals OK)")
         p_mc.add_argument("--until", help="Active until HH:MM or YYYY-MM-DD HH:MM")
         p_mc.add_argument("--cancel", action="store_true", help="Cancel active command")
         p_mc.add_argument("--dry-run", action="store_true", help="Preview without sending")
         p_mc.add_argument("--verbose", action="store_true", help="Show E2E protocol details")
+    _mc_parsers["emergency-charge"].add_argument(
+        "--start", metavar="TIME",
+        help="Window start: HH:MM or YYYY-MM-DD HH:MM (requires --until or --hours)",
+    )
 
     p_override = sub.add_parser("override", help="Override charge/discharge via E2E")
     p_override.add_argument("slots", nargs="*",
