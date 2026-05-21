@@ -148,6 +148,38 @@ Every interaction requires a full handshake before sending commands:
 Each session uses a fresh **session nonce** (16-char random alphanumeric).
 All packets in a session share the same nonce (except alive packets which generate their own).
 
+### 5.1 Relay Session TTL
+
+The relay enforces a hard session TTL of approximately **30 seconds** from the last
+packet exchange. After expiry the relay returns a 212-byte "session expired"
+response (status `21204`) and then enters a **reject window of ~30 seconds**
+during which reconnection attempts receive a 146-byte rejection response.
+
+Typical relay responses by size:
+
+| Size | Meaning |
+|------|---------|
+| 211 B | Power flow data (success) |
+| 212 B | Session expired (status 21204) |
+| 179 B | Alive ACK |
+| 180 B | Wake ACK |
+| 168 B | Heartbeat ACK |
+| 163 B | Subscription ACK (no new data) |
+| 146 B | Reconnect rejected (relay reject window) |
+
+### 5.2 Keepalive
+
+To extend a session beyond the default TTL, send the **full 4-packet handshake
+sequence** (same as the initial session handshake, steps 1–4 above) at intervals
+shorter than the relay TTL. Sending only `dev_alive + heartbeat` is insufficient
+— the relay responds with 163 B (subscription ACK/"nothing new") and does **not**
+reset the session timer.
+
+Recommended keepalive interval: **≤10 seconds** between sends.
+
+After session expiry, do **not** attempt to reconnect immediately. Wait for the
+relay reject window (~30 s) to pass before starting a new handshake.
+
 ---
 
 ## 6. Known Commands

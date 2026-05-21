@@ -10,6 +10,7 @@ import random
 import socket
 import string
 import struct
+import threading
 import time
 from typing import Callable
 
@@ -254,8 +255,7 @@ def build_wake_packet(
     msg_id: str | None = None,
 ) -> bytes:
     """Build a wake packet — nudges the relay's per-session routing table for
-    the device. Mirrors module_bmt/x/n.java:223 (setIsNeedResult=false in APK,
-    so a status=1 reply is tolerated — it's fire-and-forget).
+    the device. Fire-and-forget; a status=1 reply is tolerated.
     """
     if msg_id is None:
         msg_id = generate_msg_id()
@@ -999,7 +999,6 @@ def parse_regulate_frequency_state(payload: bytes) -> dict | None:
         raw_error = struct.unpack_from("<H", payload, 2)[0]
         has_error = raw_error != 1
 
-    # Display logic mirrors APK sb/y0.java dealRegulateFrequency()
     if has_error is True:
         display = "balancing_failed"
     elif state == 0:
@@ -1427,7 +1426,7 @@ def cancel_sell(
 # ---------------------------------------------------------------------------
 #
 # NOTE on the legacy `send_sell` / `cancel_sell` above: those send opcode 0x01A0,
-# which the APK calls SET_EMERGENCY_CHARGE — i.e. charge the battery from the
+# which the firmware calls SET_EMERGENCY_CHARGE — i.e. charge the battery from the
 # grid, NOT sell to the grid. The functions below use the correct semantics.
 # Opcodes:
 #   0x01A0  set_emergency_charge   write [on u8, start u32le, end u32le]  9B
@@ -1448,7 +1447,7 @@ def set_emergency_charge(
     """Enable/disable emergency charging over a time window.
 
     When enabling, the default window is now → top-of-current-hour + 48 h,
-    matching the APK default in ``module_bmt/m7/f.java:846``.
+    matching the firmware default.
     """
     if on:
         if start_unix is None:
@@ -1519,7 +1518,7 @@ def set_manual_selling(
 
     The inverter exports until ``target_energy_kwh`` total have been sold,
     then stops automatically. Use :func:`get_manual_selling` to poll
-    progress. Opcode 0x80A0 (APK case 18 via ``g(map)``).
+    progress.
 
     Wire:
         [on u8, target_kwh u32 LE, isExpandSelling u8] — 6 bytes total.
@@ -1969,13 +1968,10 @@ def set_peak_shaving_redundancy(
 # track state optimistically in the caller.
 
 EV_MODE_LOWEST_PRICE = 1       # Smart: charge during cheapest grid hours
-EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV — defined
-                               # in the APK's Mcu.EVChargingMode enum but
-                               # NOT surfaced in the current Android app UI
-                               # (at least on PC1-BAK15-HS10). The wire
-                               # protocol accepts it, but callers should
-                               # treat it as unsupported unless verified
-                               # against their specific hardware.
+EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV (not
+                               # surfaced in current app UI; accepted by
+                               # the wire protocol but treat as unsupported
+                               # unless verified on your specific hardware)
 EV_MODE_SCHEDULED = 3          # Smart: charge on a weekday/weekend schedule
 EV_MODE_INSTANT_FULL = 4       # Instant: charge flat-out until the car is full
 EV_MODE_INSTANT_FIXED = 5      # Instant: charge exactly ``fixed`` kWh then stop
@@ -2305,11 +2301,9 @@ def load_ev_page_data(
 # and can be changed with opcode 0x41 (SET_THIRDPARTYPV_ON).
 #
 # Wire: 0x41 A0 (subscribe mode), payload = 1 byte: 0x01=on, 0x00=off.
-# APK: dispatch-table case 56 (=0x38) in Lcom/dinsafer/module_bmt/hd/j;.b(Map);
-#      addOptionHeader short=-24511 (0xA041); wire byte-swapped → 0x41A0.
-# setIsNeedResult=false → fire-and-forget (no response payload to parse).
+# Fire-and-forget; no response payload to parse.
 
-_THIRDPARTY_PV_SET_TYPE = 0x41  # SET_THIRDPARTYPV_ON (APK Short 0xA041, wire byte-swapped)
+_THIRDPARTY_PV_SET_TYPE = 0x41  # set_thirdpartypv_on
 
 
 def set_thirdparty_pv(
@@ -2352,10 +2346,6 @@ def set_thirdparty_pv(
 # "Sell Back to Grid" (Virtual Power Plant) enables/disables grid export.
 #   0x05 A0  set_virtualpowerplant  write [on u8, len u8, user_id utf8]
 #   0x06 A0  get_virtualpowerplant  subscribe  empty payload
-#
-# APK: case 64 → j.m(Map); Short -24482 (0xA05E); setIsNeedResult=false
-#      case 11 → j.o();    Short -24481 (0xA05F)
-#      case 47 → inline Short(-24571)=0xA005; case 81 → Short(-24570)=0xA006
 
 _SELLING_PROTECTION_SET_TYPE = 0x5E
 _SELLING_PROTECTION_GET_TYPE = 0x5F
@@ -2364,10 +2354,10 @@ _VIRTUALPOWERPLANT_GET_TYPE  = 0x06
 
 
 def _build_vpp_payload(enabled: bool, user_id: str) -> bytes:
-    """Build set_virtualpowerplant (0x05) payload with optional user_id auth.
+    """Build the set_virtualpowerplant (0x05) payload.
 
-    APK j.a(String) encoding: ``[on(1B), len(1B), utf8_user_id(NB)]``.
-    Falls back to ``[on(1B)]`` only when user_id is empty.
+    When *user_id* is non-empty: ``[on(1B), len(1B), utf8_user_id(N B)]``.
+    When *user_id* is empty: ``[on(1B)]`` only.
     """
     on_byte = bytes([0x01 if enabled else 0x00])
     if not user_id:
@@ -2760,6 +2750,7 @@ class PersistentE2ESession:
         self._session_nonce: str | None = None
         self._closed = False
         self._regulate_frequency_cache: dict | None = None
+        self._lock = threading.Lock()
 
     @property
     def closed(self) -> bool:
@@ -2790,7 +2781,7 @@ class PersistentE2ESession:
         self._do_handshake()
 
     def _do_handshake(self) -> None:
-        """Run alive(home) + alive(device) + heartbeat."""
+        """Run alive(home) + alive(device) + wake + heartbeat."""
         home_alive = build_alive_packet(
             sender_end_id=self._creds["home_end_id"],
             sender_group_id=self._creds["home_group_id"],
@@ -2817,94 +2808,90 @@ class PersistentE2ESession:
             True on success, False if the session has been dropped or the
             socket is closed.
         """
-        if self._sock is None or self._closed:
-            return False
+        with self._lock:
+            if self._sock is None or self._closed:
+                return False
 
-        try:
-            dev_alive = build_alive_packet(
-                sender_end_id=self._creds["sender_end_id"],
-                sender_group_id=self._creds["sender_group_id"],
-                end_secret=self._creds["sender_end_secret"],
-            )
-            heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
-            self._send_raw(dev_alive, "Keepalive(alive)")
-            self._send_raw(heartbeat, "Keepalive(heartbeat)")
-            return True
-        except Exception as err:  # noqa: BLE001 - best-effort keepalive
-            if self._log:
-                self._log(f"Keepalive failed: {err}")
-            return False
+            try:
+                home_alive = build_alive_packet(
+                    sender_end_id=self._creds["home_end_id"],
+                    sender_group_id=self._creds["home_group_id"],
+                    end_secret=self._creds["home_end_secret"],
+                )
+                dev_alive = build_alive_packet(
+                    sender_end_id=self._creds["sender_end_id"],
+                    sender_group_id=self._creds["sender_group_id"],
+                    end_secret=self._creds["sender_end_secret"],
+                )
+                wake = build_wake_packet(self._creds, self._session_nonce)
+                heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
+                self._send_raw(home_alive, "Keepalive(home_alive)")
+                self._send_raw(dev_alive, "Keepalive(dev_alive)")
+                self._send_raw(wake, "Keepalive(wake)")
+                self._send_raw(heartbeat, "Keepalive(heartbeat)")
+                return True
+            except Exception as err:  # noqa: BLE001 - best-effort keepalive
+                if self._log:
+                    self._log(f"Keepalive failed: {err}")
+                return False
 
     def read_power_flow(self) -> dict | None:
         """Read realtime power flow (0x30) over the existing session.
 
-        Automatically re-runs the handshake if the relay has dropped the
-        session (status 21204).
+        Returns the power flow dict, or *None* if data is not available
+        (session expired, timeout, or unparseable).  The caller is responsible
+        for closing and re-establishing the session after repeated *None* returns;
+        immediate internal reconnects are deliberately avoided because the relay
+        rejects reconnection attempts made within a few seconds of session expiry.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
 
-        for attempt in range(2):
             power_pkt = build_subscription_packet(
                 self._creds, 0x30, self._session_nonce, payload=bytes([0x01]),
             )
             resp = self._send_raw(power_pkt, "PowerFlow(0x30)")
             if resp is None:
-                # Timeout — maybe session expired. Try reconnect once.
-                if attempt == 0:
-                    self._reconnect()
-                    continue
                 return None
 
-            # Check for session-expired status
+            # Session expired — caller must wait before reconnecting.
             if self._is_session_expired(resp):
                 if self._log:
-                    self._log("Session expired, reconnecting")
-                if attempt == 0:
-                    self._reconnect()
-                    continue
+                    self._log("Session expired")
                 return None
 
             result = self._try_parse_power_flow(resp)
             if result is not None:
                 return result
 
-            # Drain up to 10 more packets in case of interleaved responses
-            # from the keepalive / subscription channel.
-            # Also passively cache any 0x45 regulate-frequency pushes the
-            # device sends on the same subscription socket.
-            drained = 0
-            while drained < 10:
-                try:
-                    more_resp, _ = self._sock.recvfrom(4096)
-                    drained += 1
-                except socket.timeout:
-                    break
-                if self._is_session_expired(more_resp):
-                    if self._log:
-                        self._log("Session expired mid-drain, reconnecting")
-                    break
-                result = self._try_parse_power_flow(more_resp)
-                if result is not None:
-                    return result
-                rf = self._try_parse_regulate_frequency(more_resp)
-                if rf is not None:
-                    self._regulate_frequency_cache = rf
-                    if self._log:
-                        self._log(f"Passive 0x45 push captured: {rf}")
-
-            # If we still have nothing on the first attempt, force a reconnect
-            # and try once more. This covers the case where the relay has
-            # silently lost our subscription binding.
-            if attempt == 0:
-                if self._log:
-                    self._log("No power flow response after drain, reconnecting")
-                self._reconnect()
-                continue
+            # First response may be a subscription ACK; drain a few more packets
+            # with a short timeout so we don't stall the caller.
+            # Also passively cache any 0x45 regulate-frequency pushes.
+            prev_timeout = self._sock.gettimeout()
+            self._sock.settimeout(0.5)
+            try:
+                for _ in range(5):
+                    try:
+                        more_resp, _ = self._sock.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if self._is_session_expired(more_resp):
+                        if self._log:
+                            self._log("Session expired mid-drain")
+                        break
+                    result = self._try_parse_power_flow(more_resp)
+                    if result is not None:
+                        return result
+                    rf = self._try_parse_regulate_frequency(more_resp)
+                    if rf is not None:
+                        self._regulate_frequency_cache = rf
+                        if self._log:
+                            self._log(f"Passive 0x45 push captured: {rf}")
+            finally:
+                self._sock.settimeout(prev_timeout)
 
             return None
-
-        return None
 
     def read_regulate_frequency_state(self) -> dict | None:
         """Read FCR/mFRR frequency regulation state (0x45) over the existing session.
@@ -2913,55 +2900,54 @@ class PersistentE2ESession:
         concurrent power-flow subscription.  Returns *None* on timeout or when
         the payload cannot be decrypted.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
 
-        for attempt in range(2):
-            req_pkt = build_subscription_packet(
-                self._creds, _REGULATE_FREQ_TYPE, self._session_nonce,
-                request_mode=False,  # subscription mode (0xA0) — device rejects direct-request (0x10)
-            )
-            resp = self._send_raw(req_pkt, "RegulateFrequencyState(0x45)")
-            if resp is None:
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
+            for attempt in range(2):
+                req_pkt = build_subscription_packet(
+                    self._creds, _REGULATE_FREQ_TYPE, self._session_nonce,
+                    request_mode=False,  # subscription mode (0xA0) — device rejects direct-request (0x10)
+                )
+                resp = self._send_raw(req_pkt, "RegulateFrequencyState(0x45)")
+                if resp is None:
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            if self._is_session_expired(resp):
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
+                if self._is_session_expired(resp):
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            result = self._try_parse_regulate_frequency(resp)
-            if result is not None:
-                self._regulate_frequency_cache = result
-                return result
-
-            # Drain a few extra packets (keepalive/subscription echoes)
-            for _ in range(5):
-                try:
-                    more_resp, _ = self._sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-                if self._is_session_expired(more_resp):
-                    break
-                result = self._try_parse_regulate_frequency(more_resp)
+                result = self._try_parse_regulate_frequency(resp)
                 if result is not None:
                     self._regulate_frequency_cache = result
                     return result
 
-            if attempt == 0:
-                self._reconnect()
-                continue
+                # Drain a few extra packets (keepalive/subscription echoes)
+                for _ in range(5):
+                    try:
+                        more_resp, _ = self._sock.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if self._is_session_expired(more_resp):
+                        break
+                    result = self._try_parse_regulate_frequency(more_resp)
+                    if result is not None:
+                        self._regulate_frequency_cache = result
+                        return result
 
-            return None
+                if attempt == 0:
+                    self._reconnect()
+                    continue
 
-        # No explicit response — fall back to any passively-captured push.
-        return self._regulate_frequency_cache
+                return None
 
-        return None
+            # No explicit response — fall back to any passively-captured push.
+            return self._regulate_frequency_cache
 
     def _try_parse_regulate_frequency(self, resp: bytes) -> dict | None:
         """Decrypt+parse a response as a regulate-frequency payload. Returns None on mismatch."""
@@ -2991,63 +2977,64 @@ class PersistentE2ESession:
         Returns a dict with ``selling_protection_on`` (bool) and
         ``threshold_kwh`` (int); or *None* on timeout / parse failure.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
 
-        for attempt in range(2):
-            req_pkt = build_subscription_packet(
-                self._creds, _SELLING_PROTECTION_GET_TYPE, self._session_nonce,
-            )
-            resp = self._send_raw(req_pkt, "GetSellingProtection(0x5F)")
-            if resp is None:
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
-
-            if self._is_session_expired(resp):
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
-
-            try:
-                decrypted = decrypt_response(
-                    resp, self._creds["chat_secret"],
-                    payload_validator=_is_selling_protection_payload,
+            for attempt in range(2):
+                req_pkt = build_subscription_packet(
+                    self._creds, _SELLING_PROTECTION_GET_TYPE, self._session_nonce,
                 )
-            except Exception:  # noqa: BLE001
-                decrypted = None
+                resp = self._send_raw(req_pkt, "GetSellingProtection(0x5F)")
+                if resp is None:
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            result = parse_selling_protection_response(decrypted)
-            if result is not None:
-                return result
+                if self._is_session_expired(resp):
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            for _ in range(5):
-                try:
-                    more_resp, _ = self._sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-                if self._is_session_expired(more_resp):
-                    break
                 try:
                     decrypted = decrypt_response(
-                        more_resp, self._creds["chat_secret"],
+                        resp, self._creds["chat_secret"],
                         payload_validator=_is_selling_protection_payload,
                     )
                 except Exception:  # noqa: BLE001
-                    continue
+                    decrypted = None
+
                 result = parse_selling_protection_response(decrypted)
                 if result is not None:
                     return result
 
-            if attempt == 0:
-                self._reconnect()
-                continue
+                for _ in range(5):
+                    try:
+                        more_resp, _ = self._sock.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if self._is_session_expired(more_resp):
+                        break
+                    try:
+                        decrypted = decrypt_response(
+                            more_resp, self._creds["chat_secret"],
+                            payload_validator=_is_selling_protection_payload,
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    result = parse_selling_protection_response(decrypted)
+                    if result is not None:
+                        return result
+
+                if attempt == 0:
+                    self._reconnect()
+                    continue
+
+                return None
 
             return None
-
-        return None
 
     def read_virtualpowerplant(self) -> dict | None:
         """Read sell-back-to-grid state (0x06) over the existing session.
@@ -3055,63 +3042,64 @@ class PersistentE2ESession:
         Returns a dict with ``sell_back_to_grid_on`` (bool); or *None* on
         timeout / parse failure.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
 
-        for attempt in range(2):
-            req_pkt = build_subscription_packet(
-                self._creds, _VIRTUALPOWERPLANT_GET_TYPE, self._session_nonce,
-            )
-            resp = self._send_raw(req_pkt, "GetVirtualPowerPlant(0x06)")
-            if resp is None:
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
-
-            if self._is_session_expired(resp):
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
-
-            try:
-                decrypted = decrypt_response(
-                    resp, self._creds["chat_secret"],
-                    payload_validator=_is_virtualpowerplant_payload,
+            for attempt in range(2):
+                req_pkt = build_subscription_packet(
+                    self._creds, _VIRTUALPOWERPLANT_GET_TYPE, self._session_nonce,
                 )
-            except Exception:  # noqa: BLE001
-                decrypted = None
+                resp = self._send_raw(req_pkt, "GetVirtualPowerPlant(0x06)")
+                if resp is None:
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            result = parse_virtualpowerplant_response(decrypted)
-            if result is not None:
-                return result
+                if self._is_session_expired(resp):
+                    if attempt == 0:
+                        self._reconnect()
+                        continue
+                    return None
 
-            for _ in range(5):
-                try:
-                    more_resp, _ = self._sock.recvfrom(4096)
-                except socket.timeout:
-                    break
-                if self._is_session_expired(more_resp):
-                    break
                 try:
                     decrypted = decrypt_response(
-                        more_resp, self._creds["chat_secret"],
+                        resp, self._creds["chat_secret"],
                         payload_validator=_is_virtualpowerplant_payload,
                     )
                 except Exception:  # noqa: BLE001
-                    continue
+                    decrypted = None
+
                 result = parse_virtualpowerplant_response(decrypted)
                 if result is not None:
                     return result
 
-            if attempt == 0:
-                self._reconnect()
-                continue
+                for _ in range(5):
+                    try:
+                        more_resp, _ = self._sock.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if self._is_session_expired(more_resp):
+                        break
+                    try:
+                        decrypted = decrypt_response(
+                            more_resp, self._creds["chat_secret"],
+                            payload_validator=_is_virtualpowerplant_payload,
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    result = parse_virtualpowerplant_response(decrypted)
+                    if result is not None:
+                        return result
+
+                if attempt == 0:
+                    self._reconnect()
+                    continue
+
+                return None
 
             return None
-
-        return None
 
     def send_command(self, msg_type: int, payload: bytes) -> bytes | None:
         """Send a single write command over the existing session socket.
@@ -3128,12 +3116,13 @@ class PersistentE2ESession:
         Returns:
             The relay's response bytes, or *None* on timeout / closed session.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
-        pkt = build_subscription_packet(
-            self._creds, msg_type, self._session_nonce, payload=payload,
-        )
-        return self._send_raw(pkt, f"Command(0x{msg_type:02x})")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+            pkt = build_subscription_packet(
+                self._creds, msg_type, self._session_nonce, payload=payload,
+            )
+            return self._send_raw(pkt, f"Command(0x{msg_type:02x})")
 
     def close(self) -> None:
         """Close the socket and mark the session closed."""

@@ -714,7 +714,9 @@ class EmaldoClient:
             "home_end_secret": home_data.get("end_secret", ""),
             "home_chat_secret": home_data.get("chat_secret", ""),
             "host": device_e2e.get("host", f"{DEFAULT_E2E_HOST}:{DEFAULT_E2E_PORT}"),
-            # Required for set_virtualpowerplant (0x05) user authorisation
+            # Included so e2e commands that require user authorisation (e.g.
+            # set_virtualpowerplant / 0x05) can embed the account user-id in
+            # their payload.
             "user_id": self._session.get("user_id", "") if self._session else "",
         }
 
