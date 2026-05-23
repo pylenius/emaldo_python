@@ -32,6 +32,7 @@ this implementation.
 - **Third-party PV control** — Enable/disable third-party PV routing via E2E
 - **Sell Back to Grid** — Enable/disable VPP grid export via E2E (`set_virtualpowerplant` 0x05)
 - **Sell Limit** — Read/write daily grid-export cap in kWh/day via E2E (`set_sellingprotection` 0x5E)
+- **Manual selling** — Start/stop direct grid-export with a target kWh via E2E (`set_manual_selling` 0x80 / `get_manual_selling` 0x81)
 - **Usage analytics** — Solar, grid, battery, and revenue data
 
 ## Installation
@@ -187,6 +188,12 @@ emaldo third-party-pv --off
 emaldo sell-back-to-grid               # Read current state
 emaldo sell-back-to-grid --on
 emaldo sell-back-to-grid --off
+
+# Manual selling (direct E2E grid-export up to a target kWh)
+emaldo manual-selling                  # Read current state
+emaldo manual-selling --on --target 5  # Sell up to 5 kWh
+emaldo manual-selling --off            # Stop manual selling
+emaldo manual-selling --json           # Raw JSON output
 
 # Sell Limit (daily grid-export cap)
 emaldo sell-limit                      # Read current state (on/off + kWh/day threshold)

@@ -1488,6 +1488,78 @@ def cmd_third_party_pv(args):
         sys.exit(1)
 
 
+def cmd_manual_selling(args):
+    """Handle the 'manual-selling' subcommand (opcode 0x80/0x81)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    verbose = getattr(args, "verbose", False)
+    log = e2e_log if verbose else None
+
+    # ── --status / default read ──────────────────────────────────
+    if args.status or (not args.on and not args.off):
+        print("Reading manual selling state (0x81)…")
+        try:
+            data = client.get_manual_selling(home_id, device_id, model, log=log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        if getattr(args, "json_output", False):
+            import json
+            print(json.dumps(data, indent=2))
+            return
+
+        print(f"  Manual selling:  {'ON' if data['enabled'] else 'OFF'}")
+        print(f"  Target:          {data['target_energy_kwh']} kWh")
+        print(f"  Sold so far:     {data['sold_so_far_kwh']} kWh")
+        print(f"  Remaining:       {data['remaining_kwh']} kWh")
+        if data.get("first_use"):
+            print("  (first use — never enabled before)")
+        return
+
+    # ── --on / --off ─────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    target = getattr(args, "target", None) or 0
+
+    if enabled and target <= 0:
+        print("Error: --target N (kWh, > 0) is required when enabling manual selling.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    label = "ON" if enabled else "OFF"
+    if enabled:
+        print(f"Starting manual selling: target={target} kWh…")
+    else:
+        print("Stopping manual selling…")
+
+    try:
+        ok = client.set_manual_selling(
+            home_id, device_id, model, enabled, target, log=log,
+        )
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"  Manual selling set to {label}.")
+    else:
+        print("  Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_sell_limit(args):
     """Handle the 'sell-limit' subcommand (selling protection 0x5E/0x5F)."""
     client = load_client(args)
@@ -1891,6 +1963,17 @@ Examples:
     p_sbtg.add_argument("--on", action="store_true", default=False, help="Enable sell-back-to-grid")
     p_sbtg.add_argument("--off", action="store_true", default=False, help="Disable sell-back-to-grid")
 
+    p_ms = sub.add_parser("manual-selling",
+                          help="Start/stop manual grid-export selling (0x80/0x81) via E2E")
+    p_ms.add_argument("--status", action="store_true",
+                      help="Read current state (default when --on/--off omitted)")
+    p_ms.add_argument("--on", action="store_true", default=False, help="Enable manual selling")
+    p_ms.add_argument("--off", action="store_true", default=False, help="Disable manual selling")
+    p_ms.add_argument("--target", type=float, metavar="KWH",
+                      help="Total kWh to sell before stopping (required with --on)")
+    p_ms.add_argument("-v", "--verbose", action="store_true", help="Show E2E protocol details")
+    p_ms.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
+
     p_ps = sub.add_parser("peak-shaving", help="Peak shaving config & schedule via E2E")
     p_ps.add_argument("--show", action="store_true", help="Show current peak shaving state (default)")
     p_ps.add_argument("--enable", action="store_true", help="Enable peak shaving")
@@ -1938,6 +2021,7 @@ Examples:
         "third-party-pv": cmd_third_party_pv,
         "sell-limit": cmd_sell_limit,
         "sell-back-to-grid": cmd_sell_back_to_grid,
+        "manual-selling": cmd_manual_selling,
         "peak-shaving": cmd_peak_shaving,
         "balancing-state": cmd_balancing_state,
         "region": cmd_region, "contract": cmd_contract, "features": cmd_features,
