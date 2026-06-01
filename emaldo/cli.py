@@ -727,15 +727,24 @@ def cmd_solar(args):
         interval = data.get("interval", 5)
         total = 0
         peak = 0
+        # mppt-v2 row layout: [minute_offset, string1_W, string2_W, string3_W,
+        # pv_total_W, state]. Track each string separately to mirror the HA
+        # per-string solar energy sensors.
+        string_totals = [0, 0, 0]
         for e in entries:
             val = e[4] if len(e) >= 5 else (e[1] if len(e) >= 2 else 0)
             total += val
             peak = max(peak, val)
+            for s in range(3):
+                if len(e) > s + 1:
+                    string_totals[s] += e[s + 1]
 
         total_kwh = total * interval / 60 / 1000
         print(f"Solar Generation  (offset={args.offset})")
         print(f"  Total:      {total_kwh:.1f} kWh")
         print(f"  Peak Power: {peak}W ({peak/1000:.1f}kW)")
+        for s, st in enumerate(string_totals, start=1):
+            print(f"  String {s}:   {st * interval / 60 / 1000:.3f} kWh")
         print()
 
         for e in entries:

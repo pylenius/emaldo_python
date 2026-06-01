@@ -125,6 +125,7 @@ emaldo schedule
 emaldo power
 
 # Solar generation (--offset N for past days)
+# Shows the daily total plus a per-MPPT-string (1/2/3) breakdown
 emaldo solar
 
 # Grid import/export
