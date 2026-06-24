@@ -180,6 +180,32 @@ Recommended keepalive interval: **≤10 seconds** between sends.
 After session expiry, do **not** attempt to reconnect immediately. Wait for the
 relay reject window (~30 s) to pass before starting a new handshake.
 
+### 5.3 Persistent Session Polling
+
+For real-time monitoring, opening a fresh socket and running the full handshake
+on every read is too expensive. `PersistentE2ESession` (in `emaldo/e2e.py`)
+performs the handshake **once**, keeps a single UDP socket open, and re-uses it
+for each subsequent read (e.g. `0x30` power flow), completing in one
+request/response round trip.
+
+When polling a single long-lived socket, the relay drops the session after
+roughly **10 seconds** of inactivity (versus the ~30 s TTL for the full
+handshake flow). To keep the socket alive, send a keepalive (a fresh
+`alive(home) + alive(device) + heartbeat`) every **~7 seconds** from a
+background thread/task (`DEFAULT_KEEPALIVE_INTERVAL = 7`).
+
+**21204 recovery (in place):** if a read or keepalive observes a `21204`
+(session expired), the session re-handshakes on the **same** socket. Because the
+relay rejects re-handshakes made immediately after expiry, it waits
+`RECONNECT_BACKOFF_SECONDS` (≈2 s) before rebuilding. The keepalive path stays
+non-blocking and never sleeps/re-handshakes itself — it returns `False` on
+21204 so the caller tears the dead session down and the next `read_power_flow`
+rebuilds it.
+
+**Diagnostics:** a live session exposes `last_rtt_ms` (last UDP round-trip),
+`last_keepalive_failure_reason`, and `last_power_flow_diag` (per-read counters:
+initial timeout / session-expired / non-matching, plus drained-packet counts).
+
 ---
 
 ## 6. Known Commands

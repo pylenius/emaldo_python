@@ -29,6 +29,8 @@ this implementation.
 - **Emergency charge** — Force-charge the battery via E2E
 - **Peak shaving** — Full peak shaving control via E2E (toggle, reserves, schedule, all-day, redundancy)
 - **Grid frequency regulation** — Read FCR/mFRR balancing state via E2E
+- **Realtime power flow** — Battery/solar/grid/load watts via E2E (`get_power_flow` 0x30)
+- **Persistent E2E session** — `PersistentE2ESession` keeps one UDP socket open for fast, low-latency polling with background keepalive and automatic 21204 recovery
 - **Third-party PV control** — Enable/disable third-party PV routing via E2E
 - **Sell Back to Grid** — Enable/disable VPP grid export via E2E (`set_virtualpowerplant` 0x05)
 - **Sell Limit** — Read/write daily grid-export cap in kWh/day via E2E (`set_sellingprotection` 0x5E)
@@ -256,6 +258,52 @@ client.set_override(home_id, device_id, model, bytes(slot_values),
 client.reset_overrides(home_id, device_id, model)
 ```
 
+### Realtime Power Flow
+
+A one-shot reading opens a fresh UDP socket and runs the full handshake on every
+call:
+
+```python
+flow = client.get_power_flow(home_id, device_id, model)
+print(flow["battery_w"], flow["solar_w"], flow["grid_w"])
+```
+
+For continuous monitoring use `PersistentE2ESession`, which handshakes once,
+keeps a single socket open, and re-uses it for each read. Send a keepalive every
+~7 seconds (the relay drops idle sessions after ~10 s); the session automatically
+re-handshakes in place if the relay reports a 21204 (session expired):
+
+```python
+import threading, time
+from emaldo.e2e import PersistentE2ESession
+
+creds = client.e2e_login(home_id, device_id, model)
+session = PersistentE2ESession(creds)
+session.connect()
+
+def _keepalive_loop():
+    while not session.closed:
+        time.sleep(session.DEFAULT_KEEPALIVE_INTERVAL)  # 7 s
+        session.keepalive()
+
+threading.Thread(target=_keepalive_loop, daemon=True).start()
+
+try:
+    while True:
+        data = session.read_power_flow()   # fast — reuses the socket
+        if data:
+            print(data["battery_w"], data["solar_w"], data["grid_w"])
+        # diagnostics
+        print("RTT:", session.last_rtt_ms, "ms")
+        time.sleep(5)
+finally:
+    session.close()
+```
+
+Diagnostic properties available on a live session: `last_rtt_ms` (last UDP
+round-trip), `last_keepalive_failure_reason`, and `last_power_flow_diag` (per-read
+counters for timeouts, session-expired hits, and drained packets).
+
 ### Session Persistence
 
 
@@ -300,6 +348,7 @@ client = EmaldoClient(session=session)
 | `get_grid(home_id, device_id, model, offset)` | Grid import/export |
 | `get_strategy(home_id, device_id, model)` | Composite AI strategy view |
 | `get_battery_info(home_id, device_id, model)` | Per-cell battery data via E2E |
+| `get_power_flow(home_id, device_id, model)` | Realtime power flow (battery/solar/grid/load W) via E2E (0x30) |
 | `get_overrides(home_id, device_id, model)` | Read override state (slots + markers) |
 | `set_override(home_id, ..., slots, high_marker, low_marker)` | Set override values + markers |
 | `reset_overrides(home_id, ..., high_marker, low_marker)` | Clear overrides (optionally set markers) |
