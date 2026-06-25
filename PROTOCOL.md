@@ -533,7 +533,7 @@ Hardcoded in APK, extracted via `emaldo/extract_keys.py`:
 - **Fire-and-forget**: Commands like `0x41` (third-party PV), `0x05` (sell-back-to-grid), and `0x5E` (sell limit) have `setIsNeedResult=false` in the APK — they send no application-level response payload. Only a relay ACK (~161B) is returned.
 - **State lag**: After a write command, wait ≥1–2s before reading back state via a subscribe command — the device takes time to apply changes.
 - **Multiple responses**: Subscribe commands (`0xA0` mode) may return multiple UDP packets. The first is often a relay echo/ACK; the actual data arrives in a subsequent packet.
-- **Battery probing**: Send one `0x06` request per cabinet index (0, 1, 2, …); stop after two consecutive short (<250B) or missing responses.
+- **Battery probing**: Send one `0x06` request per *physical* slot index. Slots are addressed by their position in the cabinet (a module in the third slot answers at index 2; empty lower slots stay silent), so probing walks fixed index tiers (e.g. 0–2, 3–7, 8–12) to also cover a second cabinet whose modules start at a higher base index. Stop probing a tier after two consecutive short (<250B) or missing responses, but continue into the next tier rather than aborting the whole scan. A short per-probe timeout (≈1.5 s, vs. the full handshake timeout) keeps empty slots cheap.
 
 ---
 

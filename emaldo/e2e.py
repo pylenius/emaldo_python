@@ -856,14 +856,32 @@ def read_battery_info(
     e2e_creds: dict,
     *,
     timeout: float = 5.0,
+    probe_timeout: float = 1.5,
+    slots: list[int] | None = None,
     log: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Read battery cell info via E2E request (type 0x06).
 
-    Performs the full session flow (alive → heartbeat) then probes all known
-    cabinet slot indices. Empty slots return short replies cheaply, so they do
-    not stop discovery; only consecutive *timeouts* abort the scan because
-    each timeout costs the full socket timeout period.
+    Performs the full session flow (alive → heartbeat) then probes cabinet slot
+    indices.
+
+    The handshake uses ``timeout`` (the relay round trip can be slow), while
+    each per-slot probe uses the shorter ``probe_timeout``: an installed module
+    answers within tens of milliseconds, so the full handshake timeout is
+    wasteful for empty/non-existent cabinet slots that simply never reply.
+
+    Battery slots are addressed by physical cabinet position: a module
+    installed in the third slot answers at probe index 2 while indices 0–1 stay
+    silent. Discovery therefore cannot assume modules start at index 0, so the
+    full scan walks every tier.
+
+    Args:
+        timeout: Socket timeout (seconds) for the handshake packets.
+        probe_timeout: Socket timeout (seconds) for each 0x06 slot probe.
+        slots: When given, probe exactly these cabinet slot indices (a fast
+            re-scan of previously discovered slots). When ``None`` (default),
+            run a full cabinet discovery across all known tiers.
+        log: Optional log callback.
 
     Returns:
         List of battery-info dicts (one per module), possibly empty.
@@ -911,6 +929,52 @@ def read_battery_info(
     batteries: list[dict] = []
     seen_serials: set[str] = set()
 
+    def _probe_slot(idx: int) -> str | dict:
+        """Probe a single cabinet slot.
+
+        Returns the parsed battery dict on success, ``"timeout"`` if the slot
+        did not reply at all, or ``"empty"`` for a present-but-non-battery
+        reply (short ACK or unparseable payload).
+        """
+        req = build_subscription_packet(
+            e2e_creds, 0x06, session_nonce,
+            payload=bytes([idx]),
+            request_mode=True,
+        )
+        resp_raw = _send(req, f"Battery(idx={idx})")
+
+        if not resp_raw:
+            return "timeout"
+
+        # Responses shorter than the AES framing overhead (~50 B) cannot
+        # possibly contain a valid encrypted payload, so skip them as clearly
+        # empty or corrupt.  Everything ≥ 50 B is handed to decrypt + parse so
+        # the protocol header check (HEADER_BATTERY) decides, not a magic size
+        # threshold.  Previous threshold of 250 was too aggressive for HP5000
+        # firmware whose valid responses are ~243 B (#23).
+        if len(resp_raw) < 50:
+            if log:
+                log(f"Battery(idx={idx}): too-short reply {len(resp_raw)}B — skipped")
+            return "empty"
+
+        info = _try_parse_battery(resp_raw)
+        if info is None:
+            # First packet may be a subscription ACK — try one more.
+            try:
+                resp2, _ = sock.recvfrom(4096)
+                if log:
+                    log(f"Battery(idx={idx}) follow-up: {len(resp2)}B")
+                info = _try_parse_battery(resp2)
+            except socket.timeout:
+                if log:
+                    log(f"Battery(idx={idx}) follow-up: timeout")
+
+        if info and info["serial"] not in seen_serials:
+            seen_serials.add(info["serial"])
+            info["scan_index"] = idx
+            return info
+        return "empty"
+
     try:
         _send(home_alive, "Alive(home)")
         _send(dev_alive, "Alive(device)")
@@ -918,62 +982,45 @@ def read_battery_info(
         _send(heartbeat, "Heartbeat")
         time.sleep(0.2)
 
-        # Scan all known cabinet indices. HP5000 systems can report empty slots
-        # at low indices while valid modules live later in the range, so short
-        # empty replies must not stop discovery. True timeouts are still used
-        # as the expensive failure signal and abort after two in a row.
+        # Per-slot probes use the shorter timeout: an installed module answers
+        # in tens of milliseconds, so empty/non-existent slots must not cost
+        # the full handshake timeout each.
+        sock.settimeout(probe_timeout)
+
+        if slots is not None:
+            # Fast re-scan: probe exactly the requested (previously discovered)
+            # slots.  No tier-abort heuristics — the list is short and already
+            # known-good, and a transient miss on one slot must not stop the
+            # others from being read.
+            for idx in slots:
+                result = _probe_slot(idx)
+                if isinstance(result, dict):
+                    batteries.append(result)
+            return batteries
+
+        # Full discovery. HP5000 systems can report empty slots at low indices
+        # while valid modules live later in the range, so short empty replies
+        # must not stop discovery. True timeouts are the expensive failure
+        # signal: two in a row end the *current* tier (not the whole scan) so a
+        # second cabinet addressed at a higher tier is still discovered.
         TIERS = [(0, 3), (3, 5), (8, 5)]
 
         for tier_start, tier_size in TIERS:
-            found_in_tier = 0
             consecutive_timeouts = 0
             for idx in range(tier_start, tier_start + tier_size):
-                resp_raw = None
-                req = build_subscription_packet(
-                    e2e_creds, 0x06, session_nonce,
-                    payload=bytes([idx]),
-                    request_mode=True,
-                )
-                resp_raw = _send(req, f"Battery(idx={idx})")
+                result = _probe_slot(idx)
 
-                if not resp_raw:
-                    # True timeout — device not responding; abort on 2 in a row.
+                if result == "timeout":
+                    # Device not responding for this slot; abort this tier on
+                    # 2 in a row but still try the remaining tiers.
                     consecutive_timeouts += 1
                     if consecutive_timeouts >= 2:
-                        return batteries
+                        break
                     continue
 
                 consecutive_timeouts = 0
-
-                # Responses shorter than the AES framing overhead (~50 B)
-                # cannot possibly contain a valid encrypted payload, so skip
-                # them as clearly empty or corrupt.  Everything ≥ 50 B is
-                # handed to decrypt + parse so the protocol header check
-                # (HEADER_BATTERY) decides, not a magic size threshold.
-                # Previous threshold of 250 was too aggressive for HP5000
-                # firmware whose valid responses are ~243 B (#23).
-                if len(resp_raw) < 50:
-                    if log:
-                        log(f"Battery(idx={idx}): too-short reply {len(resp_raw)}B — skipped")
-                    continue
-
-                info = _try_parse_battery(resp_raw)
-                if info is None:
-                    # First packet may be a subscription ACK — try one more.
-                    try:
-                        resp2, _ = sock.recvfrom(4096)
-                        if log:
-                            log(f"Battery(idx={idx}) follow-up: {len(resp2)}B")
-                        info = _try_parse_battery(resp2)
-                    except socket.timeout:
-                        if log:
-                            log(f"Battery(idx={idx}) follow-up: timeout")
-
-                if info and info["serial"] not in seen_serials:
-                    seen_serials.add(info["serial"])
-                    info["scan_index"] = idx
-                    batteries.append(info)
-                    found_in_tier += 1
+                if isinstance(result, dict):
+                    batteries.append(result)
 
         return batteries
     finally:
@@ -2852,6 +2899,7 @@ class PersistentE2ESession:
             "drain_powerflow_hits": 0,
             "drain_session_expired": 0,
             "drain_timeout": 0,
+            "drain_socket_error": 0,
             "drain_exhausted": 0,
         }
         self._lock = threading.Lock()
@@ -3013,6 +3061,7 @@ class PersistentE2ESession:
             "drain_powerflow_hits": 0,
             "drain_session_expired": 0,
             "drain_timeout": 0,
+            "drain_socket_error": 0,
             "drain_exhausted": 0,
         }
         power_pkt = build_subscription_packet(
@@ -3062,6 +3111,15 @@ class PersistentE2ESession:
                 except socket.timeout:
                     self._last_power_flow_diag["drain_timeout"] = 1
                     break
+                except OSError as err:
+                    # Non-timeout socket error mid-drain (connection reset /
+                    # closed socket) means the session is broken. Surface a
+                    # typed error so the caller tears the session down and
+                    # reconnects instead of leaking a raw socket traceback.
+                    self._last_power_flow_diag["drain_socket_error"] = 1
+                    raise EmaldoE2EError(
+                        f"Socket error during power-flow drain: {err}"
+                    ) from err
                 self._last_power_flow_diag["drain_packets_seen"] += 1
                 if self._is_session_expired(more_resp):
                     self._last_power_flow_diag["drain_session_expired"] = 1
@@ -3081,7 +3139,10 @@ class PersistentE2ESession:
                     if self._log:
                         self._log(f"Passive 0x45 push captured: {rf}")
         finally:
-            self._sock.settimeout(prev_timeout)
+            try:
+                self._sock.settimeout(prev_timeout)
+            except OSError:
+                pass
 
         self._last_power_flow_diag["drain_exhausted"] = 1
 
