@@ -610,9 +610,68 @@ def cmd_power_e2e(args):
     if other:
         print(f"  Backup Box:  {other} W")
 
+    tp_pv = data.get("thirdparty_pv_on")
+    if tp_pv is not None:
+        tp_str = "on" if tp_pv else "off"
+        print(f"  3rd-party PV: {C_OK if tp_pv else C_DIM}{tp_str}{C_R}")
+
     gv = data.get("grid_valid", False)
     bv = data.get("bsensor_valid", False)
     print(f"  {C_DIM}Grid valid: {gv}  BSensor valid: {bv}{C_R}")
+
+
+def cmd_balancing_state(args):
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        if args.verbose:
+            print(f"  [E2E] {msg}", file=sys.stderr)
+
+    print("Reading balancing state via E2E (type 0x45)...", file=sys.stderr)
+    data = client.get_regulate_frequency_state(home_id, device_id, model, log=e2e_log)
+
+    if args.json_output:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    if not data:
+        if args.verbose:
+            print("  [DEBUG] Possible causes: session conflict, timeout, or "
+                  "decrypt failed. See E2E log above.", file=sys.stderr)
+        print("No balancing state data received (device did not respond or decrypt failed).")
+        return
+
+    use_color = sys.stdout.isatty()
+    if use_color:
+        C_HDR, C_OK, C_WARN, C_DIM, C_ERR, C_R = (
+            "\033[1m", "\033[32m", "\033[33m", "\033[90m", "\033[31m", "\033[0m"
+        )
+    else:
+        C_HDR = C_OK = C_WARN = C_DIM = C_ERR = C_R = ""
+
+    display = data.get("display", "unknown")
+    state_name = data.get("state_name", "?")
+    state = data.get("state", -1)
+    has_error = data.get("has_error")
+
+    _ACTIVE_STATES = {"fcr_n", "fcr_d_up", "fcr_d_down", "fcr_d_up_down", "mfrr_up", "mfrr_down"}
+    if display == "balancing_failed":
+        display_col = f"{C_ERR}balancing_failed{C_R}"
+    elif display in _ACTIVE_STATES:
+        display_col = f"{C_OK}{display}{C_R}"
+    elif display == "pre_balancing":
+        display_col = f"{C_WARN}pre_balancing{C_R}"
+    else:
+        display_col = display
+
+    print(f"{C_HDR}Grid Frequency Regulation (Balancing) State{C_R}")
+    print(f"  Display:     {display_col}")
+    print(f"  State:       {state_name} ({state})")
+    if has_error is not None:
+        err_str = f"{C_ERR}{has_error}{C_R}" if has_error != 1 else f"{C_DIM}{has_error}{C_R}"
+        print(f"  Has error:   {err_str}")
 
 
 def cmd_power_debug(args):
@@ -668,15 +727,24 @@ def cmd_solar(args):
         interval = data.get("interval", 5)
         total = 0
         peak = 0
+        # mppt-v2 row layout: [minute_offset, string1_W, string2_W, string3_W,
+        # pv_total_W, state]. Track each string separately to mirror the HA
+        # per-string solar energy sensors.
+        string_totals = [0, 0, 0]
         for e in entries:
             val = e[4] if len(e) >= 5 else (e[1] if len(e) >= 2 else 0)
             total += val
             peak = max(peak, val)
+            for s in range(3):
+                if len(e) > s + 1:
+                    string_totals[s] += e[s + 1]
 
         total_kwh = total * interval / 60 / 1000
         print(f"Solar Generation  (offset={args.offset})")
         print(f"  Total:      {total_kwh:.1f} kWh")
         print(f"  Peak Power: {peak}W ({peak/1000:.1f}kW)")
+        for s, st in enumerate(string_totals, start=1):
+            print(f"  String {s}:   {st * interval / 60 / 1000:.3f} kWh")
         print()
 
         for e in entries:
@@ -942,7 +1010,86 @@ def cmd_sell(args):
 
 def cmd_emergency_charge(args):
     """Handle the 'emergency-charge' subcommand."""
-    _cmd_manual_control(args, command_name="emergency-charge")
+    # --cancel and duration-only flows reuse the shared implementation.
+    if args.cancel or not getattr(args, "start", None):
+        _cmd_manual_control(args, command_name="emergency-charge")
+        return
+
+    # -- Explicit time-window flow (--start + --until / --hours) ------
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    try:
+        s = args.start
+        if len(s) <= 5:  # HH:MM
+            parts = s.split(":")
+            start_dt = now.replace(hour=int(parts[0]), minute=int(parts[1]),
+                                   second=0, microsecond=0)
+            if start_dt <= now:
+                start_dt += timedelta(days=1)
+        else:
+            start_dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
+    except (ValueError, IndexError):
+        print(f"Error: cannot parse start time '{args.start}'. "
+              "Use HH:MM or YYYY-MM-DD HH:MM", file=sys.stderr)
+        sys.exit(1)
+
+    end_dt = None
+    if args.until:
+        try:
+            u = args.until
+            if len(u) <= 5:  # HH:MM
+                parts = u.split(":")
+                end_dt = start_dt.replace(hour=int(parts[0]), minute=int(parts[1]),
+                                          second=0, microsecond=0)
+                if end_dt <= start_dt:
+                    end_dt += timedelta(days=1)
+            else:
+                end_dt = datetime.strptime(u, "%Y-%m-%d %H:%M")
+        except (ValueError, IndexError):
+            print(f"Error: cannot parse end time '{args.until}'. "
+                  "Use HH:MM or YYYY-MM-DD HH:MM", file=sys.stderr)
+            sys.exit(1)
+    elif args.hours:
+        end_dt = start_dt + timedelta(hours=args.hours)
+    else:
+        print("Error: --start requires --until or --hours to define the end of the window.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if end_dt <= start_dt:
+        print("Error: end time must be after start time.", file=sys.stderr)
+        sys.exit(1)
+
+    start_unix = int(start_dt.timestamp())
+    end_unix = int(end_dt.timestamp())
+    print(f"Emergency charge from {start_dt.strftime('%Y-%m-%d %H:%M')} "
+          f"to {end_dt.strftime('%Y-%m-%d %H:%M')}")
+
+    if args.dry_run:
+        print("  [Dry run - not sending]")
+        return
+
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    verbose = getattr(args, "verbose", False)
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+    log = e2e_log if verbose else None
+
+    try:
+        success = client.emergency_charge_window(
+            home_id, device_id, model, start_unix, end_unix, log=log,
+        )
+        if success:
+            print("  Emergency charge window set successfully!")
+        else:
+            print("  Command sent but no acknowledgement received.", file=sys.stderr)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_override(args):
@@ -1325,6 +1472,202 @@ def _parse_days(text: str) -> int:
     return bitmask
 
 
+def cmd_third_party_pv(args):
+    """Handle the 'third-party-pv' subcommand."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    try:
+        ok = client.set_third_party_pv(home_id, device_id, model, enabled)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    label = "on" if enabled else "off"
+    if ok:
+        print(f"Third-party PV turned {label}.")
+    else:
+        print(f"Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_manual_selling(args):
+    """Handle the 'manual-selling' subcommand (opcode 0x80/0x81)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    verbose = getattr(args, "verbose", False)
+    log = e2e_log if verbose else None
+
+    # ── --status / default read ──────────────────────────────────
+    if args.status or (not args.on and not args.off):
+        print("Reading manual selling state (0x81)…")
+        try:
+            data = client.get_manual_selling(home_id, device_id, model, log=log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        if getattr(args, "json_output", False):
+            import json
+            print(json.dumps(data, indent=2))
+            return
+
+        print(f"  Manual selling:  {'ON' if data['enabled'] else 'OFF'}")
+        print(f"  Target:          {data['target_energy_kwh']} kWh")
+        print(f"  Sold so far:     {data['sold_so_far_kwh']} kWh")
+        print(f"  Remaining:       {data['remaining_kwh']} kWh")
+        if data.get("first_use"):
+            print("  (first use — never enabled before)")
+        return
+
+    # ── --on / --off ─────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    target = getattr(args, "target", None) or 0
+
+    if enabled and target <= 0:
+        print("Error: --target N (kWh, > 0) is required when enabling manual selling.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    label = "ON" if enabled else "OFF"
+    if enabled:
+        print(f"Starting manual selling: target={target} kWh…")
+    else:
+        print("Stopping manual selling…")
+
+    try:
+        ok = client.set_manual_selling(
+            home_id, device_id, model, enabled, target, log=log,
+        )
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"  Manual selling set to {label}.")
+    else:
+        print("  Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_sell_limit(args):
+    """Handle the 'sell-limit' subcommand (selling protection 0x5E/0x5F)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    # ── Read current state ────────────────────────────────────────
+    if args.read or (not args.on and not args.off):
+        print("Reading selling-protection state (0x5F)…")
+        try:
+            data = client.get_selling_protection(home_id, device_id, model, log=e2e_log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        on = data["selling_protection_on"]
+        threshold_kwh = data["threshold_kwh"]
+        print(f"  Selling protection (export cap): {'ON' if on else 'OFF'}")
+        print(f"  Threshold: {threshold_kwh} kWh/day")
+        return
+
+    # ── Write ────────────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    threshold_kwh = args.threshold if args.threshold is not None else 0
+    label = "ON" if enabled else "OFF"
+    print(f"Setting selling protection {label}, threshold={threshold_kwh} kWh/day…")
+    try:
+        ok = client.set_selling_protection(
+            home_id, device_id, model, enabled, threshold_kwh, log=e2e_log,
+        )
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"Selling protection set to {label}.")
+    else:
+        print("Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_sell_back_to_grid(args):
+    """Handle the 'sell-back-to-grid' subcommand (VPP 0x05/0x06)."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        print(f"  [E2E] {msg}", file=sys.stderr)
+
+    # ── Read current state ────────────────────────────────────────
+    if args.read or (not args.on and not args.off):
+        print("Reading sell-back-to-grid (VPP) state (0x06)…")
+        try:
+            data = client.get_virtualpowerplant(home_id, device_id, model, log=e2e_log)
+        except (EmaldoE2EError, EmaldoAPIError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if data is None:
+            print("No response from device (timeout or parse failure).", file=sys.stderr)
+            sys.exit(1)
+
+        on = data["sell_back_to_grid_on"]
+        print(f"  Sell Back to Grid: {'ON' if on else 'OFF'}")
+        return
+
+    # ── Write ────────────────────────────────────────────────────
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    label = "ON" if enabled else "OFF"
+    print(f"Setting sell-back-to-grid {label}…")
+    try:
+        ok = client.set_virtualpowerplant(home_id, device_id, model, enabled, log=e2e_log)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ok:
+        print(f"Sell-back-to-grid set to {label}.")
+    else:
+        print("Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_peak_shaving(args):
     """Handle the 'peak-shaving' subcommand."""
     client = load_client(args)
@@ -1571,6 +1914,10 @@ Examples:
     p_pe2e.add_argument("-v", "--verbose", action="store_true", help="Show E2E session details")
     p_pe2e.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
 
+    p_bs = sub.add_parser("balancing-state", help="Grid frequency regulation (balancing) state via E2E")
+    p_bs.add_argument("-v", "--verbose", action="store_true", help="Show E2E session details")
+    p_bs.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
+
     sub.add_parser("power-debug", help="Dump raw /bmt/list-bmt/ device data (same API the app uses)")
 
     p_solar = sub.add_parser("solar", help="Solar/MPPT generation stats")
@@ -1581,15 +1928,22 @@ Examples:
 
     sub.add_parser("strategy", help="AI mode strategy (FCR + schedule + revenue)")
 
-    # sell and emergency-charge use the same E2E protocol (type 0x01)
+    # sell and emergency-charge use the same E2E protocol (type 0x01);
+    # emergency-charge additionally supports an explicit start-time window.
+    _mc_parsers: dict = {}
     for cmd_name, cmd_help in [("sell", "Sell (discharge-to-grid) via E2E"),
                                 ("emergency-charge", "Emergency charge via E2E")]:
         p_mc = sub.add_parser(cmd_name, help=cmd_help)
+        _mc_parsers[cmd_name] = p_mc
         p_mc.add_argument("--hours", type=float, help="Duration in hours (decimals OK)")
         p_mc.add_argument("--until", help="Active until HH:MM or YYYY-MM-DD HH:MM")
         p_mc.add_argument("--cancel", action="store_true", help="Cancel active command")
         p_mc.add_argument("--dry-run", action="store_true", help="Preview without sending")
         p_mc.add_argument("--verbose", action="store_true", help="Show E2E protocol details")
+    _mc_parsers["emergency-charge"].add_argument(
+        "--start", metavar="TIME",
+        help="Window start: HH:MM or YYYY-MM-DD HH:MM (requires --until or --hours)",
+    )
 
     p_override = sub.add_parser("override", help="Override charge/discharge via E2E")
     p_override.add_argument("slots", nargs="*",
@@ -1601,6 +1955,33 @@ Examples:
     p_override.add_argument("--markers", nargs=2, type=int, metavar=("LOW", "HIGH"),
                             help="Set battery markers (e.g. --markers 20 72)")
     p_override.add_argument("--dry-run", action="store_true", help="Build without sending")
+
+    p_tp = sub.add_parser("third-party-pv", help="Enable or disable third-party PV input via E2E")
+    p_tp.add_argument("--on", action="store_true", default=False, help="Enable third-party PV")
+    p_tp.add_argument("--off", action="store_true", default=False, help="Disable third-party PV")
+
+    p_sl = sub.add_parser("sell-limit", help="Read/write selling-protection state (0x5E/0x5F) via E2E")
+    p_sl.add_argument("--read", action="store_true", help="Read current state (default when no --on/--off)")
+    p_sl.add_argument("--on", action="store_true", default=False, help="Enable selling protection (cap/block export)")
+    p_sl.add_argument("--off", action="store_true", default=False, help="Disable selling protection (allow export)")
+    p_sl.add_argument("--threshold", type=int, metavar="KWH", default=None,
+                      help="Export threshold in kWh/day (used with --on, default 0, max 300)")
+
+    p_sbtg = sub.add_parser("sell-back-to-grid", help="Read/write sell-back-to-grid VPP state (0x05/0x06) via E2E")
+    p_sbtg.add_argument("--read", action="store_true", help="Read current state (default when no --on/--off)")
+    p_sbtg.add_argument("--on", action="store_true", default=False, help="Enable sell-back-to-grid")
+    p_sbtg.add_argument("--off", action="store_true", default=False, help="Disable sell-back-to-grid")
+
+    p_ms = sub.add_parser("manual-selling",
+                          help="Start/stop manual grid-export selling (0x80/0x81) via E2E")
+    p_ms.add_argument("--status", action="store_true",
+                      help="Read current state (default when --on/--off omitted)")
+    p_ms.add_argument("--on", action="store_true", default=False, help="Enable manual selling")
+    p_ms.add_argument("--off", action="store_true", default=False, help="Disable manual selling")
+    p_ms.add_argument("--target", type=float, metavar="KWH",
+                      help="Total kWh to sell before stopping (required with --on)")
+    p_ms.add_argument("-v", "--verbose", action="store_true", help="Show E2E protocol details")
+    p_ms.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
 
     p_ps = sub.add_parser("peak-shaving", help="Peak shaving config & schedule via E2E")
     p_ps.add_argument("--show", action="store_true", help="Show current peak shaving state (default)")
@@ -1646,7 +2027,12 @@ Examples:
         "power": cmd_power, "solar": cmd_solar, "grid": cmd_grid,
         "strategy": cmd_strategy, "sell": cmd_sell,
         "emergency-charge": cmd_emergency_charge, "override": cmd_override,
+        "third-party-pv": cmd_third_party_pv,
+        "sell-limit": cmd_sell_limit,
+        "sell-back-to-grid": cmd_sell_back_to_grid,
+        "manual-selling": cmd_manual_selling,
         "peak-shaving": cmd_peak_shaving,
+        "balancing-state": cmd_balancing_state,
         "region": cmd_region, "contract": cmd_contract, "features": cmd_features,
         "raw": cmd_raw, "encrypt": cmd_encrypt, "decrypt": cmd_decrypt,
         "version-check": cmd_version_check, "power-debug": cmd_power_debug,

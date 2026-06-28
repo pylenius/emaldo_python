@@ -6,10 +6,12 @@ The protocol uses AES-256-CBC encryption over UDP.
 """
 
 import json
+import logging
 import random
 import socket
 import string
 import struct
+import threading
 import time
 from typing import Callable
 
@@ -25,6 +27,8 @@ from .const import (
     get_app_id,
 )
 from .exceptions import EmaldoE2EError
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +67,7 @@ def build_override_packet(
     *,
     high_marker: int = DEFAULT_MARKER_HIGH,
     low_marker: int = DEFAULT_MARKER_LOW,
+    battery_range_override: bool = False,
 ) -> bytes:
     """Build an E2E override UDP packet (type 0x1a).
 
@@ -73,6 +78,11 @@ def build_override_packet(
         msg_id: 27-char message ID (generated if *None*).
         high_marker: High battery marker percentage (default 72).
         low_marker: Low battery marker percentage (default 20).
+        battery_range_override: When ``True`` sets byte 2 to 0x01 — this is
+            the "AI Battery Range = override" flag that the app's Battery
+            Range save sends (BmtCmd.SET_RESERVE_MODE_AI). When ``False``
+            (default) byte 2 is 0x00 → Battery Range stays in AI mode and
+            only the per-slot overrides apply.
 
     Returns:
         Complete UDP packet ready to send.
@@ -88,8 +98,9 @@ def build_override_packet(
     assert len(msg_id) == 27
 
     # Payload: 4-byte header + slot bytes
-    # Header: [high_marker, low_marker, version_flag, slot_count]
-    override_payload = bytes([high_marker, low_marker, 0x00, n_slots]) + slot_values
+    # Header: [high_marker, low_marker, enable_flag, slot_count]
+    enable_byte = 0x01 if battery_range_override else 0x00
+    override_payload = bytes([high_marker, low_marker, enable_byte, n_slots]) + slot_values
     encrypted = encrypt_payload(override_payload, e2e_creds["chat_secret"], nonce)
 
     pkt = bytes([0xD9, 0xA0, 0xA0])
@@ -247,8 +258,7 @@ def build_wake_packet(
     msg_id: str | None = None,
 ) -> bytes:
     """Build a wake packet — nudges the relay's per-session routing table for
-    the device. Mirrors module_bmt/x/n.java:223 (setIsNeedResult=false in APK,
-    so a status=1 reply is tolerated — it's fire-and-forget).
+    the device. Fire-and-forget; a status=1 reply is tolerated.
     """
     if msg_id is None:
         msg_id = generate_msg_id()
@@ -377,7 +387,7 @@ def parse_override_state(payload: bytes) -> dict | None:
     Payload format:
         Byte 0:   high battery marker (percentage)
         Byte 1:   low battery marker (percentage)
-        Byte 2:   version / dirty flag
+        Byte 2:   battery-range override-enable flag (0 = AI, 1 = override)
         Byte 3:   ``0x58`` (subscription response tag)
         Bytes 4-7: extended header
         Byte 8:   slot count (``0x60``=96 or ``0xC0``=192)
@@ -390,7 +400,8 @@ def parse_override_state(payload: bytes) -> dict | None:
 
     Returns:
         Dict with ``slots`` (list of 96 or 192 ints), ``high_marker``,
-        and ``low_marker``; or *None* on invalid input.
+        ``low_marker``, and ``battery_range_override`` (bool); or *None*
+        on invalid input.
     """
     if payload is None or len(payload) < 105:
         return None
@@ -402,12 +413,18 @@ def parse_override_state(payload: bytes) -> dict | None:
     return {
         "high_marker": payload[0],
         "low_marker": payload[1],
+        "battery_range_override": payload[2] != 0,
         "slots": list(payload[9 : 9 + n_slots]),
     }
 
 
 def parse_battery_data(payload: bytes) -> dict | None:
     """Parse a type 0x06 battery-info response payload.
+
+    The decrypted payload starts with the 2-byte battery signature
+    (``0x03 0x00``) which the HP5000 firmware also uses as ``state_flags``.
+    Fixed battery fields follow, then length-prefixed strings, and finally
+    the trailing cabinet/position/index/capacity fields.
 
     Payload layout (≥80 bytes, variable due to length-prefixed strings):
 
@@ -423,8 +440,8 @@ def parse_battery_data(payload: bytes) -> dict | None:
     10-13   4     current_ma                 LE int32 signed milliamps
                                              (negative = discharging)
     14-15   2     soc                        LE uint16 percent
-    16-17   2     current_energy_wh          LE uint16 Wh
-    18-19   2     full_energy_wh             LE uint16 Wh
+    16-17   2     current_energy_wh_raw      LE uint16 in 0.5 Wh ticks
+    18-19   2     full_energy_wh_raw         LE uint16 in 0.5 Wh ticks
     20-21   2     cycle_count                LE uint16
     22-23   2     soh                        LE uint16 percent
     24      1     id_info_len                length N₁ (usually 0)
@@ -433,23 +450,34 @@ def parse_battery_data(payload: bytes) -> dict | None:
     …       N₂    version                    ASCII model string
     +1      1     barcode_len                length N₃
     …       N₃    barcode                    ASCII serial number
-    +1      1     index                      battery instance index
     +1      1     cabinet_index              cabinet slot index
     +1      1     cabinet_position_index     position within cabinet
+    +1      1     index                      battery instance index
     +2      2     capacity                   LE uint16
     ======  ====  =========================  ================================
 
     Returns:
         Dict with decoded fields, or *None* if payload is invalid.
     """
-    if payload is None or len(payload) < 26:
+    if payload is None:
+        _LOGGER.debug("parse_battery_data: payload is None")
+        return None
+    if len(payload) < 26:
+        _LOGGER.debug("parse_battery_data: payload too short (%d bytes)", len(payload))
         return None
     if payload[0] != HEADER_BATTERY[0] or payload[1] != HEADER_BATTERY[1]:
+        _LOGGER.debug(
+            "parse_battery_data: wrong start marker (got 0x%02x 0x%02x, want 0x%02x 0x%02x)",
+            payload[0], payload[1], HEADER_BATTERY[0], HEADER_BATTERY[1],
+        )
         return None
+    _LOGGER.debug("parse_battery_data: raw payload length %d", len(payload))
 
     def _deci_kelvin_to_c(raw: int) -> float:
         return round(raw / 10.0 - 273.15, 1)
 
+    # Fixed fields.  The first two bytes pass the HEADER_BATTERY check but are
+    # also interpreted as state_flags by the HP5000 firmware.
     state_flags = struct.unpack_from("<H", payload, 0)[0]
     bms_temp_raw = struct.unpack_from("<H", payload, 2)[0]
     electrode_a_raw = struct.unpack_from("<H", payload, 4)[0]
@@ -457,8 +485,11 @@ def parse_battery_data(payload: bytes) -> dict | None:
     voltage_mv = struct.unpack_from("<H", payload, 8)[0]
     current_ma = struct.unpack_from("<i", payload, 10)[0]
     soc = struct.unpack_from("<H", payload, 14)[0]
-    current_energy_wh = struct.unpack_from("<H", payload, 16)[0]
-    full_energy_wh = struct.unpack_from("<H", payload, 18)[0]
+    # Battery energy fields are encoded in 0.5 Wh ticks.
+    current_energy_raw = struct.unpack_from("<H", payload, 16)[0]
+    full_energy_raw = struct.unpack_from("<H", payload, 18)[0]
+    current_energy_wh = int(round(current_energy_raw * 0.5))
+    full_energy_wh = int(round(full_energy_raw * 0.5))
     cycle_count = struct.unpack_from("<H", payload, 20)[0]
     soh = struct.unpack_from("<H", payload, 22)[0]
 
@@ -467,23 +498,40 @@ def parse_battery_data(payload: bytes) -> dict | None:
     id_info_len = payload[pos]; pos += 1
     id_info = payload[pos : pos + id_info_len].decode("ascii", errors="replace") if id_info_len else ""
     pos += id_info_len
+    _LOGGER.debug(
+        "parse_battery_data: id_info_len=%d pos=%d payload_len=%d",
+        id_info_len, pos, len(payload),
+    )
 
     if pos >= len(payload):
+        _LOGGER.debug("parse_battery_data: abort after id_info (pos=%d >= len=%d)", pos, len(payload))
         return None
     version_len = payload[pos]; pos += 1
     model = payload[pos : pos + version_len].decode("ascii", errors="replace") if version_len else ""
     pos += version_len
+    _LOGGER.debug(
+        "parse_battery_data: version_len=%d pos=%d payload_len=%d",
+        version_len, pos, len(payload),
+    )
 
     if pos >= len(payload):
+        _LOGGER.debug("parse_battery_data: abort after version (pos=%d >= len=%d)", pos, len(payload))
         return None
     barcode_len = payload[pos]; pos += 1
     serial = payload[pos : pos + barcode_len].decode("ascii", errors="replace") if barcode_len else ""
     pos += barcode_len
+    _LOGGER.debug(
+        "parse_battery_data: barcode_len=%d pos=%d payload_len=%d",
+        barcode_len, pos, len(payload),
+    )
 
-    # Trailing fixed fields
-    index = payload[pos] if pos < len(payload) else 0; pos += 1
+    # Trailing fixed fields follow the variable-length strings directly.
+    # Verified layout on HP5000: after barcode comes cabinet_index (1 byte),
+    # cabinet_position (1 byte), battery instance index (1 byte), then
+    # capacity (2 bytes LE).
     cabinet_index = payload[pos] if pos < len(payload) else 0; pos += 1
     cabinet_position = payload[pos] if pos < len(payload) else 0; pos += 1
+    index = payload[pos] if pos < len(payload) else 0; pos += 1
     capacity = struct.unpack_from("<H", payload, pos)[0] if pos + 2 <= len(payload) else 0
 
     return {
@@ -511,25 +559,49 @@ def parse_battery_data(payload: bytes) -> dict | None:
     }
 
 
+_POWER_FLOW_MAX_RAW_HECTOWATTS = 2000  # 200 kW per channel; filters bogus multi-MW spikes
+
+
+def _has_reasonable_power_flow_values(payload: bytes) -> bool:
+    """Return True when the raw 0x30 fields look plausible.
+
+    The protocol reports powers in units of 100 W. Real systems are expected
+    to stay far below 200 kW per channel, so values beyond that are treated as
+    corrupt or misclassified payloads rather than published as multi-megawatt
+    sensor spikes.
+    """
+    signed_offsets = (0, 2, 4, 6, 8, 10)
+    for offset in signed_offsets:
+        if abs(struct.unpack_from("<h", payload, offset)[0]) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+            return False
+
+    unsigned_offsets = (12, 14)
+    for offset in unsigned_offsets:
+        if struct.unpack_from("<H", payload, offset)[0] > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+            return False
+
+    if len(payload) >= 18:
+        if payload[16] not in (0, 1) or payload[17] not in (0, 1):
+            return False
+    if len(payload) >= 20 and payload[19] not in (0, 1):
+        return False
+    if len(payload) >= 22:
+        if abs(struct.unpack_from("<h", payload, 20)[0]) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+            return False
+
+    return True
+
+
 def _is_power_flow_payload(payload: bytes) -> bool:
     """Check if decrypted payload looks like a power flow response.
 
     Power flow responses are 16–24 bytes of signed-short watt values.
-    Heuristic: correct length range, reasonable watt values, and
-    boolean flags at bytes 16–17 must be 0 or 1.
+    Heuristic: correct length range, plausible per-channel raw values,
+    and boolean flags using valid 0/1 encodings.
     """
     if len(payload) < 16 or len(payload) > 24:
         return False
-    # First two shorts should be reasonable watt values
-    battery_w = struct.unpack_from("<h", payload, 0)[0]
-    solar_w = struct.unpack_from("<h", payload, 2)[0]
-    if abs(battery_w) >= 30000 or abs(solar_w) >= 30000:
-        return False
-    # Bytes 16–17 are boolean flags (gridValid, bsensorValid)
-    if len(payload) >= 18:
-        if payload[16] not in (0, 1) or payload[17] not in (0, 1):
-            return False
-    return True
+    return _has_reasonable_power_flow_values(payload)
 
 
 def parse_power_flow(payload: bytes) -> dict | None:
@@ -568,6 +640,8 @@ def parse_power_flow(payload: bytes) -> dict | None:
         Dict with decoded power flow values, or *None* if invalid.
     """
     if payload is None or len(payload) < 16:
+        return None
+    if not _is_power_flow_payload(payload):
         return None
 
     # Protocol values are in units of 100 W (hectowatts).
@@ -782,17 +856,35 @@ def read_battery_info(
     e2e_creds: dict,
     *,
     timeout: float = 5.0,
-    max_batteries: int = 10,
+    probe_timeout: float = 1.5,
+    slots: list[int] | None = None,
     log: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Read battery cell info via E2E request (type 0x06).
 
-    Performs the full session flow (alive → heartbeat) then sends one
-    request per cabinet index (0 … *max_batteries*-1).  The device
-    responds with battery data for each valid index.
+    Performs the full session flow (alive → heartbeat) then probes cabinet slot
+    indices.
+
+    The handshake uses ``timeout`` (the relay round trip can be slow), while
+    each per-slot probe uses the shorter ``probe_timeout``: an installed module
+    answers within tens of milliseconds, so the full handshake timeout is
+    wasteful for empty/non-existent cabinet slots that simply never reply.
+
+    Battery slots are addressed by physical cabinet position: a module
+    installed in the third slot answers at probe index 2 while indices 0–1 stay
+    silent. Discovery therefore cannot assume modules start at index 0, so the
+    full scan walks every tier.
+
+    Args:
+        timeout: Socket timeout (seconds) for the handshake packets.
+        probe_timeout: Socket timeout (seconds) for each 0x06 slot probe.
+        slots: When given, probe exactly these cabinet slot indices (a fast
+            re-scan of previously discovered slots). When ``None`` (default),
+            run a full cabinet discovery across all known tiers.
+        log: Optional log callback.
 
     Returns:
-        List of battery-info dicts (one per cell), possibly empty.
+        List of battery-info dicts (one per module), possibly empty.
     """
     session_nonce = generate_nonce()
 
@@ -837,6 +929,52 @@ def read_battery_info(
     batteries: list[dict] = []
     seen_serials: set[str] = set()
 
+    def _probe_slot(idx: int) -> str | dict:
+        """Probe a single cabinet slot.
+
+        Returns the parsed battery dict on success, ``"timeout"`` if the slot
+        did not reply at all, or ``"empty"`` for a present-but-non-battery
+        reply (short ACK or unparseable payload).
+        """
+        req = build_subscription_packet(
+            e2e_creds, 0x06, session_nonce,
+            payload=bytes([idx]),
+            request_mode=True,
+        )
+        resp_raw = _send(req, f"Battery(idx={idx})")
+
+        if not resp_raw:
+            return "timeout"
+
+        # Responses shorter than the AES framing overhead (~50 B) cannot
+        # possibly contain a valid encrypted payload, so skip them as clearly
+        # empty or corrupt.  Everything ≥ 50 B is handed to decrypt + parse so
+        # the protocol header check (HEADER_BATTERY) decides, not a magic size
+        # threshold.  Previous threshold of 250 was too aggressive for HP5000
+        # firmware whose valid responses are ~243 B (#23).
+        if len(resp_raw) < 50:
+            if log:
+                log(f"Battery(idx={idx}): too-short reply {len(resp_raw)}B — skipped")
+            return "empty"
+
+        info = _try_parse_battery(resp_raw)
+        if info is None:
+            # First packet may be a subscription ACK — try one more.
+            try:
+                resp2, _ = sock.recvfrom(4096)
+                if log:
+                    log(f"Battery(idx={idx}) follow-up: {len(resp2)}B")
+                info = _try_parse_battery(resp2)
+            except socket.timeout:
+                if log:
+                    log(f"Battery(idx={idx}) follow-up: timeout")
+
+        if info and info["serial"] not in seen_serials:
+            seen_serials.add(info["serial"])
+            info["scan_index"] = idx
+            return info
+        return "empty"
+
     try:
         _send(home_alive, "Alive(home)")
         _send(dev_alive, "Alive(device)")
@@ -844,53 +982,45 @@ def read_battery_info(
         _send(heartbeat, "Heartbeat")
         time.sleep(0.2)
 
-        # Send all battery requests, then collect responses.
-        # The app sends one request per cabinet index.
-        request_pkts = []
-        for idx in range(max_batteries):
-            req = build_subscription_packet(
-                e2e_creds, 0x06, session_nonce,
-                payload=bytes([idx]),
-                request_mode=True,
-            )
-            request_pkts.append((idx, req))
+        # Per-slot probes use the shorter timeout: an installed module answers
+        # in tens of milliseconds, so empty/non-existent slots must not cost
+        # the full handshake timeout each.
+        sock.settimeout(probe_timeout)
 
-        consecutive_short = 0
-        for idx, req_pkt in request_pkts:
-            resp = _send(req_pkt, f"Battery(idx={idx})")
-            if not resp:
-                consecutive_short += 1
-                if consecutive_short >= 2:
-                    break
-                continue
+        if slots is not None:
+            # Fast re-scan: probe exactly the requested (previously discovered)
+            # slots.  No tier-abort heuristics — the list is short and already
+            # known-good, and a transient miss on one slot must not stop the
+            # others from being read.
+            for idx in slots:
+                result = _probe_slot(idx)
+                if isinstance(result, dict):
+                    batteries.append(result)
+            return batteries
 
-            # A short response (e.g. 206B vs 275B) means no battery at
-            # this index — stop probing after one such reply.
-            if len(resp) < 250:
-                consecutive_short += 1
-                if consecutive_short >= 1:
-                    break
-                continue
+        # Full discovery. HP5000 systems can report empty slots at low indices
+        # while valid modules live later in the range, so short empty replies
+        # must not stop discovery. True timeouts are the expensive failure
+        # signal: two in a row end the *current* tier (not the whole scan) so a
+        # second cabinet addressed at a higher tier is still discovered.
+        TIERS = [(0, 3), (3, 5), (8, 5)]
 
-            info = _try_parse_battery(resp)
-            if info is None:
-                # First response might be an echo/ACK; try reading next
-                try:
-                    resp2, _ = sock.recvfrom(4096)
-                    if log:
-                        log(f"  follow-up: {len(resp2)}B")
-                    info = _try_parse_battery(resp2)
-                except socket.timeout:
-                    pass
+        for tier_start, tier_size in TIERS:
+            consecutive_timeouts = 0
+            for idx in range(tier_start, tier_start + tier_size):
+                result = _probe_slot(idx)
 
-            if info and info["serial"] not in seen_serials:
-                seen_serials.add(info["serial"])
-                batteries.append(info)
-                consecutive_short = 0
-            else:
-                consecutive_short += 1
-                if consecutive_short >= 2:
-                    break
+                if result == "timeout":
+                    # Device not responding for this slot; abort this tier on
+                    # 2 in a row but still try the remaining tiers.
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= 2:
+                        break
+                    continue
+
+                consecutive_timeouts = 0
+                if isinstance(result, dict):
+                    batteries.append(result)
 
         return batteries
     finally:
@@ -926,6 +1056,191 @@ def _log_power_flow_raw(payload: bytes, log: Callable[..., None]) -> None:
         log(f"  [19]    thirdpartyPVOn  = {payload[19]}")
     if len(payload) >= 22:
         log(f"  [20:22] dualPowerWat    = {struct.unpack_from('<h', payload, 20)[0]}")
+
+
+# ---------------------------------------------------------------------------
+# Grid frequency regulation state (FCR / mFRR balancing)
+# ---------------------------------------------------------------------------
+
+# E2E type for GET_REGULATE_FREQUENCY_STATE
+_REGULATE_FREQ_TYPE = 0x45
+
+# RegulateFrequencyStateType enum values (Mcu.java)
+_REGULATE_FREQ_STATES: dict[int, str] = {
+    0: "Idle",
+    1: "OnHold",
+    2: "FcrN",
+    3: "FcrDUp",
+    4: "FcrDDown",
+    5: "FcrDUpDown",
+    6: "MFRRUp",
+    7: "MFRRDown",
+}
+
+
+def _is_regulate_frequency_payload(payload: bytes) -> bool:
+    """Check if decrypted payload is a regulate-frequency-state response.
+
+    Response is 2 or 4 bytes: state(LE u16) [+ has_error(LE u16)].
+    State value must be in 0..7.
+    """
+    if payload is None or len(payload) not in (2, 4):
+        return False
+    state = struct.unpack_from("<H", payload, 0)[0]
+    return state in _REGULATE_FREQ_STATES
+
+
+def parse_regulate_frequency_state(payload: bytes) -> dict | None:
+    """Parse a GET_REGULATE_FREQUENCY_STATE response payload.
+
+    Payload layout:
+        bytes [0..1]  state      LE uint16 — RegulateFrequencyStateType value
+        bytes [2..3]  has_error  LE uint16 — present only when len > 2
+
+    Returns:
+        Dict with:
+            ``state`` (int): raw enum value 0–7
+            ``state_name`` (str): human-readable name (e.g. "FcrN")
+            ``has_error`` (bool | None): True when device reports error;
+                None when not present in payload
+            ``display`` (str): "idle" | "pre_balancing" | "fcr_n" |
+                "fcr_d_up" | "fcr_d_down" | "fcr_d_up_down" |
+                "mfrr_up" | "mfrr_down" | "balancing_failed"
+        or *None* on invalid input.
+    """
+    if payload is None or len(payload) < 2:
+        return None
+
+    state = struct.unpack_from("<H", payload, 0)[0]
+    if state not in _REGULATE_FREQ_STATES:
+        return None
+
+    has_error: bool | None = None
+    if len(payload) >= 4:
+        raw_error = struct.unpack_from("<H", payload, 2)[0]
+        has_error = raw_error != 1
+
+    if has_error is True:
+        display = "balancing_failed"
+    elif state == 0:
+        display = "idle"
+    elif state == 1:
+        display = "pre_balancing"
+    elif state == 2:
+        display = "fcr_n"
+    elif state == 3:
+        display = "fcr_d_up"
+    elif state == 4:
+        display = "fcr_d_down"
+    elif state == 5:
+        display = "fcr_d_up_down"
+    elif state == 6:
+        display = "mfrr_up"
+    else:  # state == 7
+        display = "mfrr_down"
+
+    return {
+        "state": state,
+        "state_name": _REGULATE_FREQ_STATES[state],
+        "has_error": has_error,
+        "display": display,
+    }
+
+
+def read_regulate_frequency_state(
+    e2e_creds: dict,
+    *,
+    timeout: float = 5.0,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read real-time FCR/mFRR grid frequency regulation state (E2E type 0x45).
+
+    Sends GET_REGULATE_FREQUENCY_STATE to the device and returns a dict
+    with ``state``, ``state_name``, ``has_error``, and ``display``.
+
+    ``display`` is one of:
+      - ``"idle"``             — no balancing activity
+      - ``"pre_balancing"``    — device is on hold, balancing imminent
+      - ``"fcr_n"``            — actively providing FCR-N
+      - ``"fcr_d_up"``         — actively providing FCR-D Up
+      - ``"fcr_d_down"``       — actively providing FCR-D Down
+      - ``"fcr_d_up_down"``    — actively providing FCR-D Up+Down
+      - ``"mfrr_up"``          — providing mFRR Up
+      - ``"mfrr_down"``        — providing mFRR Down
+      - ``"balancing_failed"`` — device reported an error
+
+    Returns *None* if the device did not respond or payload was unreadable.
+    """
+    session_nonce = generate_nonce()
+
+    home_alive = build_alive_packet(
+        sender_end_id=e2e_creds["home_end_id"],
+        sender_group_id=e2e_creds["home_group_id"],
+        end_secret=e2e_creds["home_end_secret"],
+    )
+    dev_alive = build_alive_packet(
+        sender_end_id=e2e_creds["sender_end_id"],
+        sender_group_id=e2e_creds["sender_group_id"],
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
+    req_pkt = build_subscription_packet(
+        e2e_creds, _REGULATE_FREQ_TYPE, session_nonce,
+        request_mode=True,
+    )
+
+    host, port = _resolve_host(e2e_creds["host"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    addr = (host, port)
+
+    def _send(pkt: bytes, label: str) -> bytes | None:
+        sock.sendto(pkt, addr)
+        try:
+            resp, _ = sock.recvfrom(4096)
+            if log:
+                log(f"{label}: sent {len(pkt)}B → got {len(resp)}B")
+            return resp
+        except socket.timeout:
+            if log:
+                log(f"{label}: sent {len(pkt)}B → no response")
+            return None
+
+    try:
+        _send(home_alive, "Alive(home)")
+        _send(dev_alive, "Alive(device)")
+        _send(heartbeat, "Heartbeat")
+        time.sleep(0.2)
+
+        resp = _send(req_pkt, "RegulateFrequencyState(0x45)")
+        if not resp:
+            return None
+
+        decrypted = decrypt_response(
+            resp, e2e_creds["chat_secret"],
+            payload_validator=_is_regulate_frequency_payload,
+        )
+        result = parse_regulate_frequency_state(decrypted)
+        if result is not None:
+            return result
+
+        # First response may be an echo/ACK; try a few more
+        for _ in range(5):
+            try:
+                resp, _ = sock.recvfrom(4096)
+                decrypted = decrypt_response(
+                    resp, e2e_creds["chat_secret"],
+                    payload_validator=_is_regulate_frequency_payload,
+                )
+                result = parse_regulate_frequency_state(decrypted)
+                if result is not None:
+                    return result
+            except socket.timeout:
+                break
+
+        return None
+    finally:
+        sock.close()
 
 
 def read_power_flow(
@@ -1023,13 +1338,16 @@ def send_override(
     *,
     high_marker: int = DEFAULT_MARKER_HIGH,
     low_marker: int = DEFAULT_MARKER_LOW,
+    battery_range_override: bool = False,
     timeout: float = 3.0,
     log: Callable[..., None] | None = None,
 ) -> bool:
     """Send override slot values via E2E protocol.
 
     Performs the full session flow and sends the override packet.
-    Returns *True* if the server acknowledged the override.
+    Returns *True* if the server acknowledged the override. Set
+    ``battery_range_override=True`` to also activate the app's
+    "Battery Range = override" mode (byte 2 of payload).
     """
     session_nonce = generate_nonce()
 
@@ -1048,6 +1366,7 @@ def send_override(
     override_pkt = build_override_packet(
         e2e_creds, slot_values, nonce=session_nonce,
         high_marker=high_marker, low_marker=low_marker,
+        battery_range_override=battery_range_override,
     )
 
     host, port = _resolve_host(e2e_creds["host"])
@@ -1228,7 +1547,7 @@ def cancel_sell(
 # ---------------------------------------------------------------------------
 #
 # NOTE on the legacy `send_sell` / `cancel_sell` above: those send opcode 0x01A0,
-# which the APK calls SET_EMERGENCY_CHARGE — i.e. charge the battery from the
+# which the firmware calls SET_EMERGENCY_CHARGE — i.e. charge the battery from the
 # grid, NOT sell to the grid. The functions below use the correct semantics.
 # Opcodes:
 #   0x01A0  set_emergency_charge   write [on u8, start u32le, end u32le]  9B
@@ -1249,7 +1568,7 @@ def set_emergency_charge(
     """Enable/disable emergency charging over a time window.
 
     When enabling, the default window is now → top-of-current-hour + 48 h,
-    matching the APK default in ``module_bmt/m7/f.java:846``.
+    matching the firmware default.
     """
     if on:
         if start_unix is None:
@@ -1320,7 +1639,7 @@ def set_manual_selling(
 
     The inverter exports until ``target_energy_kwh`` total have been sold,
     then stops automatically. Use :func:`get_manual_selling` to poll
-    progress. Opcode 0x80A0 (APK case 18 via ``g(map)``).
+    progress.
 
     Wire:
         [on u8, target_kwh u32 LE, isExpandSelling u8] — 6 bytes total.
@@ -1770,13 +2089,10 @@ def set_peak_shaving_redundancy(
 # track state optimistically in the caller.
 
 EV_MODE_LOWEST_PRICE = 1       # Smart: charge during cheapest grid hours
-EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV — defined
-                               # in the APK's Mcu.EVChargingMode enum but
-                               # NOT surfaced in the current Android app UI
-                               # (at least on PC1-BAK15-HS10). The wire
-                               # protocol accepts it, but callers should
-                               # treat it as unsupported unless verified
-                               # against their specific hardware.
+EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV (not
+                               # surfaced in current app UI; accepted by
+                               # the wire protocol but treat as unsupported
+                               # unless verified on your specific hardware)
 EV_MODE_SCHEDULED = 3          # Smart: charge on a weekday/weekend schedule
 EV_MODE_INSTANT_FULL = 4       # Instant: charge flat-out until the car is full
 EV_MODE_INSTANT_FIXED = 5      # Instant: charge exactly ``fixed`` kWh then stop
@@ -2098,6 +2414,389 @@ def load_ev_page_data(
 
 
 # ---------------------------------------------------------------------------
+# Third-party PV
+# ---------------------------------------------------------------------------
+#
+# The official app exposes a boolean "Third-Party PV" switch under Energy
+# Settings. The state is returned in the 0x30 power-flow response (byte 19)
+# and can be changed with opcode 0x41 (SET_THIRDPARTYPV_ON).
+#
+# Wire: 0x41 A0 (subscribe mode), payload = 1 byte: 0x01=on, 0x00=off.
+# Fire-and-forget; no response payload to parse.
+
+_THIRDPARTY_PV_SET_TYPE = 0x41  # set_thirdpartypv_on
+
+
+def set_thirdparty_pv(
+    e2e_creds: dict,
+    enabled: bool,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bool:
+    """Enable or disable third-party PV input (type 0x41).
+
+    Sends ``SET_THIRDPARTYPV_ON`` with a 1-byte boolean payload.
+    This is a fire-and-forget command; the updated state is visible
+    in the next :func:`read_power_flow` response (byte 19).
+
+    Returns *True* if the server acknowledged the command.
+    """
+    session_nonce = generate_nonce()
+    payload = bytes([0x01 if enabled else 0x00])
+    pkt = build_subscription_packet(
+        e2e_creds, _THIRDPARTY_PV_SET_TYPE, session_nonce, payload=payload,
+    )
+    results = _run_session(
+        e2e_creds, [("SetThirdpartyPV(0x41)", pkt)],
+        timeout=timeout, log=log,
+    )
+    _, resp = results[0]
+    return resp is not None
+
+
+# ---------------------------------------------------------------------------
+# Selling protection (Sell Limit: 0x5E/0x5F)
+# and Sell Back to Grid / Virtual Power Plant (0x05/0x06)
+# ---------------------------------------------------------------------------
+#
+# "Selling protection" caps or blocks daily grid export.
+#   0x5E A0  set_sellingprotection  write [on u8, threshold u32le]  5 bytes
+#   0x5F A0  get_sellingprotection  subscribe  empty payload
+#
+# "Sell Back to Grid" (Virtual Power Plant) enables/disables grid export.
+#   0x05 A0  set_virtualpowerplant  write [on u8, len u8, user_id utf8]
+#   0x06 A0  get_virtualpowerplant  subscribe  empty payload
+
+_SELLING_PROTECTION_SET_TYPE = 0x5E
+_SELLING_PROTECTION_GET_TYPE = 0x5F
+_VIRTUALPOWERPLANT_SET_TYPE  = 0x05
+_VIRTUALPOWERPLANT_GET_TYPE  = 0x06
+
+
+def _build_vpp_payload(enabled: bool, user_id: str) -> bytes:
+    """Build the set_virtualpowerplant (0x05) payload.
+
+    When *user_id* is non-empty: ``[on(1B), len(1B), utf8_user_id(N B)]``.
+    When *user_id* is empty: ``[on(1B)]`` only.
+    """
+    on_byte = bytes([0x01 if enabled else 0x00])
+    if not user_id:
+        return on_byte
+    uid_utf8 = user_id.encode("utf-8")
+    return on_byte + bytes([len(uid_utf8) & 0xFF]) + uid_utf8
+
+
+def set_selling_protection(
+    e2e_creds: dict,
+    enabled: bool,
+    threshold_w: int = 0,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bool:
+    """Enable/disable selling protection (grid-export cap). 0x5E fire-and-forget.
+
+    When *enabled* is ``True`` grid export is blocked/capped; ``False`` allows it.
+    *threshold_w* is the daily export cap in kWh (0 = safe default; max 300).
+    """
+    payload = struct.pack("<BI", 0x01 if enabled else 0x00, threshold_w & 0xFFFFFFFF)
+    if log:
+        log(f"SetSellingProtection payload ({len(payload)}B): {payload.hex()}")
+    session_nonce = generate_nonce()
+    pkt = build_subscription_packet(
+        e2e_creds, _SELLING_PROTECTION_SET_TYPE, session_nonce, payload=payload,
+    )
+    results = _run_session(
+        e2e_creds, [("SetSellingProtection(0x5E)", pkt)],
+        timeout=timeout, log=log,
+    )
+    _, resp = results[0]
+    return resp is not None
+
+
+def _is_selling_protection_payload(payload: bytes) -> bool:
+    """Check if decrypted payload is a get_sellingprotection response.
+
+    Actual device layout: [extra_byte(1B), on(1B), threshold_u32le(4B), ...]
+    Minimum 6 bytes. Reject power-flow (≥20 B) and other large frames.
+    The extra leading byte appears to be a firstUse/status byte (always 0x00);
+    the on flag is at offset 1.
+    """
+    return (
+        payload is not None
+        and 6 <= len(payload) <= 16
+        and payload[1] in (0, 1)
+    )
+
+
+def parse_selling_protection_response(payload: bytes | None) -> dict | None:
+    """Decode a get_sellingprotection (0x5F) response payload.
+
+    Actual device payload layout (confirmed by protocol capture):
+        byte 0:     extra/status byte (firstUse flag, always 0x00)
+        byte 1:     on (1 = selling protection enabled = export blocked/capped)
+        bytes 2-5:  threshold as LE uint32 in kWh/day
+
+    Returns:
+        Dict with ``selling_protection_on`` (bool) and ``threshold_kwh`` (int);
+        or *None* on invalid input.
+    """
+    if payload is None or len(payload) < 6:
+        return None
+    return {
+        "selling_protection_on": bool(payload[1]),
+        "threshold_kwh": struct.unpack_from("<I", payload, 2)[0],
+    }
+
+
+def get_selling_protection(
+    e2e_creds: dict,
+    *,
+    timeout: float = 5.0,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read current selling-protection state (0x5F) with a fresh handshake.
+
+    Returns a dict with ``selling_protection_on`` (bool) and ``threshold_kwh``
+    (int); or *None* on failure.  With *log* set every packet is hex-dumped,
+    including all drained frames (useful for protocol debugging).
+    """
+    session_nonce = generate_nonce()
+    home_alive = build_alive_packet(
+        sender_end_id=e2e_creds["home_end_id"],
+        sender_group_id=e2e_creds["home_group_id"],
+        end_secret=e2e_creds["home_end_secret"],
+    )
+    dev_alive = build_alive_packet(
+        sender_end_id=e2e_creds["sender_end_id"],
+        sender_group_id=e2e_creds["sender_group_id"],
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
+    wake = build_wake_packet(e2e_creds, session_nonce)
+    sub_pkt = build_subscription_packet(
+        e2e_creds, _SELLING_PROTECTION_GET_TYPE, session_nonce,
+    )
+
+    host, port = _resolve_host(e2e_creds["host"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    addr = (host, port)
+
+    def _send(pkt: bytes, label: str) -> bytes | None:
+        sock.sendto(pkt, addr)
+        try:
+            resp, _ = sock.recvfrom(4096)
+            if log:
+                log(f"{label}: sent {len(pkt)}B → got {len(resp)}B | {resp.hex()}")
+            return resp
+        except socket.timeout:
+            if log:
+                log(f"{label}: sent {len(pkt)}B → timeout")
+            return None
+
+    def _try_decrypt_verbose(resp: bytes, label: str) -> bytes | None:
+        """Decrypt without validator (for debug), log raw payload."""
+        try:
+            raw = decrypt_response(resp, e2e_creds["chat_secret"])
+            if log and raw is not None:
+                b0 = f"0x{raw[0]:02x}" if raw else "N/A"
+                log(f"  {label} raw decrypted ({len(raw)}B): {raw.hex()} | byte[0]={b0}")
+            return raw
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        _send(home_alive, "Alive(home)")
+        _send(dev_alive, "Alive(device)")
+        _send(wake, "Wake")
+        _send(heartbeat, "Heartbeat")
+        time.sleep(0.2)
+
+        resp = _send(sub_pkt, "GetSellingProtection(0x5F)")
+        if not resp:
+            return None
+
+        _try_decrypt_verbose(resp, "GetSellingProtection[0]")
+        decrypted = decrypt_response(
+            resp, e2e_creds["chat_secret"],
+            payload_validator=_is_selling_protection_payload,
+        )
+        result = parse_selling_protection_response(decrypted)
+        if result is not None:
+            return result
+
+        for i in range(10):
+            try:
+                resp, _ = sock.recvfrom(4096)
+                if log:
+                    log(f"Drain[{i}] ({len(resp)}B): {resp.hex()}")
+                _try_decrypt_verbose(resp, f"Drain[{i}]")
+                decrypted = decrypt_response(
+                    resp, e2e_creds["chat_secret"],
+                    payload_validator=_is_selling_protection_payload,
+                )
+                result = parse_selling_protection_response(decrypted)
+                if result is not None:
+                    return result
+            except socket.timeout:
+                if log:
+                    log("Drain: no more packets (timeout)")
+                break
+
+        return None
+    finally:
+        sock.close()
+
+
+def _is_virtualpowerplant_payload(payload: bytes) -> bool:
+    """Return True if payload looks like a get_virtualpowerplant (0x06) response.
+
+    1–4 bytes, byte 0 is 0 or 1. The strict size limit avoids confusing this
+    with the battery-info 0x06 response (which is much longer).
+    """
+    return payload is not None and 1 <= len(payload) <= 4 and payload[0] in (0, 1)
+
+
+def parse_virtualpowerplant_response(payload: bytes | None) -> dict | None:
+    """Decode a get_virtualpowerplant (0x06) response payload.
+
+    Payload layout:
+        byte 0:  on (1 = sell-back to grid enabled)
+    """
+    if payload is None or len(payload) < 1:
+        return None
+    return {"sell_back_to_grid_on": bool(payload[0])}
+
+
+def set_virtualpowerplant(
+    e2e_creds: dict,
+    enabled: bool,
+    *,
+    user_id: str = "",
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bool:
+    """Set sell-back-to-grid (VPP) state. 0x05 fire-and-forget.
+
+    *user_id* must match the logged-in account's user_id; the device firmware
+    uses it for authorisation and ignores the command when it is absent.
+    """
+    payload = _build_vpp_payload(enabled, user_id)
+    if log:
+        log(f"SetVirtualPowerPlant payload ({len(payload)}B): {payload.hex()} "
+            f"(user_id={user_id!r})")
+    session_nonce = generate_nonce()
+    pkt = build_subscription_packet(
+        e2e_creds, _VIRTUALPOWERPLANT_SET_TYPE, session_nonce, payload=payload,
+    )
+    results = _run_session(
+        e2e_creds, [("SetVirtualPowerPlant(0x05)", pkt)],
+        timeout=timeout, log=log,
+    )
+    _, resp = results[0]
+    return resp is not None
+
+
+def get_virtualpowerplant(
+    e2e_creds: dict,
+    *,
+    timeout: float = 5.0,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read sell-back-to-grid state (0x06) with a fresh handshake.
+
+    Returns a dict with ``sell_back_to_grid_on`` (bool); or *None* on failure.
+    """
+    session_nonce = generate_nonce()
+    home_alive = build_alive_packet(
+        sender_end_id=e2e_creds["home_end_id"],
+        sender_group_id=e2e_creds["home_group_id"],
+        end_secret=e2e_creds["home_end_secret"],
+    )
+    dev_alive = build_alive_packet(
+        sender_end_id=e2e_creds["sender_end_id"],
+        sender_group_id=e2e_creds["sender_group_id"],
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
+    wake = build_wake_packet(e2e_creds, session_nonce)
+    sub_pkt = build_subscription_packet(
+        e2e_creds, _VIRTUALPOWERPLANT_GET_TYPE, session_nonce,
+    )
+
+    host, port = _resolve_host(e2e_creds["host"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    addr = (host, port)
+
+    def _send(pkt: bytes, label: str) -> bytes | None:
+        sock.sendto(pkt, addr)
+        try:
+            resp, _ = sock.recvfrom(4096)
+            if log:
+                log(f"{label}: sent {len(pkt)}B → got {len(resp)}B | {resp.hex()}")
+            return resp
+        except socket.timeout:
+            if log:
+                log(f"{label}: sent {len(pkt)}B → timeout")
+            return None
+
+    def _try_decrypt_verbose(resp: bytes, label: str) -> bytes | None:
+        try:
+            raw = decrypt_response(resp, e2e_creds["chat_secret"])
+            if log and raw is not None:
+                b0 = f"0x{raw[0]:02x}" if raw else "N/A"
+                log(f"  {label} raw decrypted ({len(raw)}B): {raw.hex()} | byte[0]={b0}")
+            return raw
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        _send(home_alive, "Alive(home)")
+        _send(dev_alive, "Alive(device)")
+        _send(wake, "Wake")
+        _send(heartbeat, "Heartbeat")
+        time.sleep(0.2)
+
+        resp = _send(sub_pkt, "GetVirtualPowerPlant(0x06)")
+        if not resp:
+            return None
+
+        _try_decrypt_verbose(resp, "GetVirtualPowerPlant[0]")
+        decrypted = decrypt_response(
+            resp, e2e_creds["chat_secret"],
+            payload_validator=_is_virtualpowerplant_payload,
+        )
+        result = parse_virtualpowerplant_response(decrypted)
+        if result is not None:
+            return result
+
+        for i in range(10):
+            try:
+                resp, _ = sock.recvfrom(4096)
+                if log:
+                    log(f"Drain[{i}] ({len(resp)}B): {resp.hex()}")
+                _try_decrypt_verbose(resp, f"Drain[{i}]")
+                decrypted = decrypt_response(
+                    resp, e2e_creds["chat_secret"],
+                    payload_validator=_is_virtualpowerplant_payload,
+                )
+                result = parse_virtualpowerplant_response(decrypted)
+                if result is not None:
+                    return result
+            except socket.timeout:
+                if log:
+                    log("Drain: no more packets (timeout)")
+                break
+
+        return None
+    finally:
+        sock.close()
+
+
+# ---------------------------------------------------------------------------
 # Persistent E2E Session (for real-time polling)
 # ---------------------------------------------------------------------------
 
@@ -2112,11 +2811,11 @@ class PersistentE2ESession:
     session alive with periodic keepalives. Subsequent action calls reuse the
     same socket and complete in a single request/response round trip.
 
-    The session expires on the relay server after a few minutes without
+    The session expires on the relay server after ~10 seconds without
     keepalive (status 21204). Call :meth:`keepalive` periodically (every
-    ~15 seconds) from a background thread or asyncio task to prevent this.
-    The session automatically re-runs the handshake on :meth:`read_power_flow`
-    if a 21204 error is detected.
+    ~7 seconds) from a background thread or asyncio task to prevent this.
+    The session automatically re-handshakes in place on :meth:`read_power_flow`
+    and :meth:`keepalive` if a 21204 error is detected.
 
     Typical usage (synchronous)::
 
@@ -2144,18 +2843,31 @@ class PersistentE2ESession:
 
         def _keepalive_loop():
             while not session.closed:
-                time.sleep(15)
+                time.sleep(7)
                 session.keepalive()
 
         threading.Thread(target=_keepalive_loop, daemon=True).start()
     """
 
-    #: Keepalive interval in seconds. The relay server times out idle sessions
-    #: after ~3 minutes; 15 seconds provides a generous safety margin.
-    DEFAULT_KEEPALIVE_INTERVAL = 15
+    #: Keepalive interval in seconds.  The relay server times out idle
+    #: sessions after ~10 s; the coordinator's ``KEEPALIVE_INTERVAL``
+    #: (7 s) must stay below that to prevent premature expiry.  This class
+    #: constant is the documented reference for standalone usage.
+    DEFAULT_KEEPALIVE_INTERVAL = 7
 
     #: Status code returned when the relay has dropped the session.
     SESSION_EXPIRED_STATUS = 21204
+
+    #: Backoff (seconds) before re-handshaking after a 21204 (session expired).
+    #: The relay rejects re-handshakes made immediately after expiry, so wait
+    #: briefly before rebuilding the session.
+    RECONNECT_BACKOFF_SECONDS = 2.0
+
+    #: Extra packet drain budget after a power-flow request when the first
+    #: response is not the power payload itself (for example subscription ACKs
+    #: or unrelated pushes arriving first on a healthy session).
+    POWER_FLOW_DRAIN_PACKETS = 5
+    POWER_FLOW_DRAIN_TIMEOUT_SECONDS = 0.5
 
     def __init__(
         self,
@@ -2171,6 +2883,26 @@ class PersistentE2ESession:
         self._addr: tuple[str, int] | None = None
         self._session_nonce: str | None = None
         self._closed = False
+        self._regulate_frequency_cache: dict | None = None
+        self._last_rtt_ms: float | None = None
+        self._last_keepalive_failure_reason: str | None = None
+        self._last_handshake_monotonic: float | None = None
+        self._last_keepalive_monotonic: float | None = None
+        self._last_21204_monotonic: float | None = None
+        self._last_21204_stage: str | None = None
+        self._last_power_flow_diag: dict[str, int | bool] = {
+            "initial_timeout": 0,
+            "initial_session_expired": 0,
+            "initial_nonmatching": 0,
+            "drain_packets_seen": 0,
+            "drain_regfreq_hits": 0,
+            "drain_powerflow_hits": 0,
+            "drain_session_expired": 0,
+            "drain_timeout": 0,
+            "drain_socket_error": 0,
+            "drain_exhausted": 0,
+        }
+        self._lock = threading.Lock()
 
     @property
     def closed(self) -> bool:
@@ -2178,9 +2910,29 @@ class PersistentE2ESession:
         return self._closed
 
     @property
+    def regulate_frequency_cache(self) -> dict | None:
+        """Last 0x45 state passively captured during power-flow polling."""
+        return self._regulate_frequency_cache
+
+    @property
     def connected(self) -> bool:
         """True when the session has an open socket and valid handshake."""
         return self._sock is not None and not self._closed
+
+    @property
+    def last_rtt_ms(self) -> float | None:
+        """Latest UDP request/response RTT in milliseconds."""
+        return self._last_rtt_ms
+
+    @property
+    def last_keepalive_failure_reason(self) -> str | None:
+        """Last keepalive failure reason for diagnostics."""
+        return self._last_keepalive_failure_reason
+
+    @property
+    def last_power_flow_diag(self) -> dict[str, int | bool]:
+        """Diagnostics from the latest power-flow read attempt."""
+        return dict(self._last_power_flow_diag)
 
     def connect(self) -> None:
         """Open the UDP socket and run the alive+heartbeat handshake."""
@@ -2196,7 +2948,8 @@ class PersistentE2ESession:
         self._do_handshake()
 
     def _do_handshake(self) -> None:
-        """Run alive(home) + alive(device) + heartbeat."""
+        """Run alive(home) + alive(device) + wake + heartbeat."""
+        started = time.perf_counter()
         home_alive = build_alive_packet(
             sender_end_id=self._creds["home_end_id"],
             sender_group_id=self._creds["home_group_id"],
@@ -2215,95 +2968,239 @@ class PersistentE2ESession:
         self._send_raw(wake, "Wake")
         self._send_raw(heartbeat, "Heartbeat")
         time.sleep(0.2)
+        self._last_handshake_monotonic = time.perf_counter()
+        if self._log:
+            elapsed_ms = (self._last_handshake_monotonic - started) * 1000.0
+            self._log(f"Handshake complete in {elapsed_ms:.1f}ms")
 
     def keepalive(self) -> bool:
         """Send a fresh alive+heartbeat to keep the session alive.
 
-        Returns:
-            True on success, False if the session has been dropped or the
-            socket is closed.
-        """
-        if self._sock is None or self._closed:
-            return False
+        This must stay fast and non-blocking: the keepalive task is created
+        via ``async_create_task`` and tracked by Home Assistant's bootstrap as
+        a pending startup task, so it must not perform long operations such as
+        ``time.sleep`` or a full re-handshake.  Recovery from a 21204 (session
+        expired) is therefore handled by :meth:`read_power_flow`, which runs on
+        a dedicated poll, not here.
 
-        try:
-            dev_alive = build_alive_packet(
-                sender_end_id=self._creds["sender_end_id"],
-                sender_group_id=self._creds["sender_group_id"],
-                end_secret=self._creds["sender_end_secret"],
-            )
-            heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
-            self._send_raw(dev_alive, "Keepalive(alive)")
-            self._send_raw(heartbeat, "Keepalive(heartbeat)")
-            return True
-        except Exception as err:  # noqa: BLE001 - best-effort keepalive
-            if self._log:
-                self._log(f"Keepalive failed: {err}")
-            return False
+        Returns:
+            True if the keepalive packets were sent, False if the session has
+            been dropped/expired (21204) or the socket is closed.  Returning
+            False on 21204 lets the coordinator's keepalive loop tear the dead
+            session down so :meth:`read_power_flow` rebuilds it next poll.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                self._last_keepalive_failure_reason = "closed"
+                return False
+
+            self._last_keepalive_failure_reason = None
+
+            try:
+                home_alive = build_alive_packet(
+                    sender_end_id=self._creds["home_end_id"],
+                    sender_group_id=self._creds["home_group_id"],
+                    end_secret=self._creds["home_end_secret"],
+                )
+                dev_alive = build_alive_packet(
+                    sender_end_id=self._creds["sender_end_id"],
+                    sender_group_id=self._creds["sender_group_id"],
+                    end_secret=self._creds["sender_end_secret"],
+                )
+                wake = build_wake_packet(self._creds, self._session_nonce)
+                heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
+                resp = self._send_raw(home_alive, "Keepalive(home_alive)")
+                self._send_raw(dev_alive, "Keepalive(dev_alive)")
+                self._send_raw(wake, "Keepalive(wake)")
+                self._send_raw(heartbeat, "Keepalive(heartbeat)")
+                self._last_keepalive_monotonic = time.perf_counter()
+                # If the relay reports the session as expired, do NOT reconnect
+                # here (would block the startup-tracked keepalive task).  Signal
+                # failure so the loop tears the session down; read_power_flow
+                # will rebuild it on the next poll.
+                if resp is not None and self._is_session_expired(resp):
+                    if self._log:
+                        self._log("Keepalive saw 21204 — session expired")
+                    self._last_keepalive_failure_reason = "session_expired_21204"
+                    return False
+                return True
+            except Exception as err:  # noqa: BLE001 - best-effort keepalive
+                if self._log:
+                    self._log(f"Keepalive failed: {err}")
+                self._last_keepalive_failure_reason = "exception"
+                return False
 
     def read_power_flow(self) -> dict | None:
         """Read realtime power flow (0x30) over the existing session.
 
-        Automatically re-runs the handshake if the relay has dropped the
-        session (status 21204).
+        Returns the power flow dict, or *None* if data is not available
+        (session expired, timeout, or unparseable).  On a 21204 (session
+        expired) the session is re-handshaked in place with a short backoff,
+        then the method returns *None* so the next scheduled poll reads from
+        the refreshed session.
         """
-        if self._sock is None or self._closed:
-            raise EmaldoE2EError("Session is not connected")
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
 
-        for attempt in range(2):
-            power_pkt = build_subscription_packet(
-                self._creds, 0x30, self._session_nonce, payload=bytes([0x01]),
-            )
-            resp = self._send_raw(power_pkt, "PowerFlow(0x30)")
-            if resp is None:
-                # Timeout — maybe session expired. Try reconnect once.
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
+            return self._read_power_flow_locked(reconnect_on_expiry=True)
 
-            # Check for session-expired status
-            if self._is_session_expired(resp):
+    def _read_power_flow_locked(self, *, reconnect_on_expiry: bool) -> dict | None:
+        """Power-flow read body.  Caller must hold ``self._lock``.
+
+        When *reconnect_on_expiry* is *True* (first attempt), a 21204 response
+        triggers an in-place re-handshake. We then return *None* and let the
+        coordinator's next poll read using the refreshed session.
+        """
+        self._last_power_flow_diag = {
+            "initial_timeout": 0,
+            "initial_session_expired": 0,
+            "initial_nonmatching": 0,
+            "drain_packets_seen": 0,
+            "drain_regfreq_hits": 0,
+            "drain_powerflow_hits": 0,
+            "drain_session_expired": 0,
+            "drain_timeout": 0,
+            "drain_socket_error": 0,
+            "drain_exhausted": 0,
+        }
+        power_pkt = build_subscription_packet(
+            self._creds, 0x30, self._session_nonce, payload=bytes([0x01]),
+        )
+        resp = self._send_raw(power_pkt, "PowerFlow(0x30)")
+        if resp is None:
+            self._last_power_flow_diag["initial_timeout"] = 1
+            return None
+
+        # Session expired — reconnect in place and retry once.
+        if self._is_session_expired(resp):
+            self._last_power_flow_diag["initial_session_expired"] = 1
+            now = time.perf_counter()
+            self._last_21204_monotonic = now
+            self._last_21204_stage = "initial"
+            if self._log:
+                handshake_age_ms = self._age_ms(self._last_handshake_monotonic, now)
+                keepalive_age_ms = self._age_ms(self._last_keepalive_monotonic, now)
+                self._log(
+                    "Session expired on power-flow read "
+                    f"(age_since_handshake={handshake_age_ms}, "
+                    f"age_since_keepalive={keepalive_age_ms})"
+                )
+            if reconnect_on_expiry and self._reconnect_after_expiry():
                 if self._log:
-                    self._log("Session expired, reconnecting")
-                if attempt == 0:
-                    self._reconnect()
-                    continue
-                return None
+                    self._log(
+                        "Session re-handshaked after 21204; deferring power-flow "
+                        "read until next poll"
+                    )
+            return None
 
-            result = self._try_parse_power_flow(resp)
-            if result is not None:
-                return result
+        result = self._try_parse_power_flow(resp)
+        if result is not None:
+            return result
+        self._last_power_flow_diag["initial_nonmatching"] = 1
 
-            # Drain up to 10 more packets in case of interleaved responses
-            # from the keepalive / subscription channel.
-            drained = 0
-            while drained < 10:
+        # First response may be a subscription ACK or another interleaved push;
+        # drain a few more packets with a short timeout before declaring the
+        # read empty. Also passively cache any 0x45 regulate-frequency pushes.
+        prev_timeout = self._sock.gettimeout()
+        self._sock.settimeout(self.POWER_FLOW_DRAIN_TIMEOUT_SECONDS)
+        try:
+            for _ in range(self.POWER_FLOW_DRAIN_PACKETS):
                 try:
                     more_resp, _ = self._sock.recvfrom(4096)
-                    drained += 1
                 except socket.timeout:
+                    self._last_power_flow_diag["drain_timeout"] = 1
                     break
+                except OSError as err:
+                    # Non-timeout socket error mid-drain (connection reset /
+                    # closed socket) means the session is broken. Surface a
+                    # typed error so the caller tears the session down and
+                    # reconnects instead of leaking a raw socket traceback.
+                    self._last_power_flow_diag["drain_socket_error"] = 1
+                    raise EmaldoE2EError(
+                        f"Socket error during power-flow drain: {err}"
+                    ) from err
+                self._last_power_flow_diag["drain_packets_seen"] += 1
                 if self._is_session_expired(more_resp):
+                    self._last_power_flow_diag["drain_session_expired"] = 1
+                    self._last_21204_monotonic = time.perf_counter()
+                    self._last_21204_stage = "drain"
                     if self._log:
-                        self._log("Session expired mid-drain, reconnecting")
+                        self._log("Session expired mid-drain")
                     break
                 result = self._try_parse_power_flow(more_resp)
                 if result is not None:
+                    self._last_power_flow_diag["drain_powerflow_hits"] += 1
                     return result
+                rf = self._try_parse_regulate_frequency(more_resp)
+                if rf is not None:
+                    self._last_power_flow_diag["drain_regfreq_hits"] += 1
+                    self._regulate_frequency_cache = rf
+                    if self._log:
+                        self._log(f"Passive 0x45 push captured: {rf}")
+        finally:
+            try:
+                self._sock.settimeout(prev_timeout)
+            except OSError:
+                pass
 
-            # If we still have nothing on the first attempt, force a reconnect
-            # and try once more. This covers the case where the relay has
-            # silently lost our subscription binding.
-            if attempt == 0:
-                if self._log:
-                    self._log("No power flow response after drain, reconnecting")
-                self._reconnect()
-                continue
-
-            return None
+        self._last_power_flow_diag["drain_exhausted"] = 1
 
         return None
+
+    def read_regulate_frequency_state(self) -> dict | None:
+        """Read FCR/mFRR frequency regulation state (0x45) over the existing session.
+
+        Reuses the persistent socket/session so it does not conflict with the
+        concurrent power-flow subscription.  Returns *None* on timeout or when
+        the payload cannot be decrypted.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+
+            req_pkt = build_subscription_packet(
+                self._creds, _REGULATE_FREQ_TYPE, self._session_nonce,
+                request_mode=False,  # subscription mode (0xA0) — device rejects direct-request (0x10)
+            )
+            resp = self._send_raw(req_pkt, "RegulateFrequencyState(0x45)")
+            if resp is None:
+                return self._regulate_frequency_cache
+
+            if self._is_session_expired(resp):
+                return self._regulate_frequency_cache
+
+            result = self._try_parse_regulate_frequency(resp)
+            if result is not None:
+                self._regulate_frequency_cache = result
+                return result
+
+            # Drain a few extra packets (keepalive/subscription echoes)
+            for _ in range(5):
+                try:
+                    more_resp, _ = self._sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                if self._is_session_expired(more_resp):
+                    break
+                result = self._try_parse_regulate_frequency(more_resp)
+                if result is not None:
+                    self._regulate_frequency_cache = result
+                    return result
+
+            # No explicit response — fall back to any passively-captured push.
+            return self._regulate_frequency_cache
+
+    def _try_parse_regulate_frequency(self, resp: bytes) -> dict | None:
+        """Decrypt+parse a response as a regulate-frequency payload. Returns None on mismatch."""
+        try:
+            decrypted = decrypt_response(
+                resp, self._creds["chat_secret"],
+                payload_validator=_is_regulate_frequency_payload,
+            )
+        except Exception:  # noqa: BLE001 - best-effort parse
+            return None
+        return parse_regulate_frequency_state(decrypted)
 
     def _try_parse_power_flow(self, resp: bytes) -> dict | None:
         """Decrypt+parse a response as a power flow payload. Returns None on mismatch."""
@@ -2316,25 +3213,358 @@ class PersistentE2ESession:
             return None
         return parse_power_flow(decrypted)
 
+    def read_selling_protection(self) -> dict | None:
+        """Read selling-protection state (0x5F) over the existing session.
+
+        Returns a dict with ``selling_protection_on`` (bool) and
+        ``threshold_kwh`` (int); or *None* on timeout / parse failure.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+
+            req_pkt = build_subscription_packet(
+                self._creds, _SELLING_PROTECTION_GET_TYPE, self._session_nonce,
+            )
+            resp = self._send_raw(req_pkt, "GetSellingProtection(0x5F)")
+            if resp is None:
+                return None
+
+            if self._is_session_expired(resp):
+                return None
+
+            try:
+                decrypted = decrypt_response(
+                    resp, self._creds["chat_secret"],
+                    payload_validator=_is_selling_protection_payload,
+                )
+            except Exception:  # noqa: BLE001
+                decrypted = None
+
+            result = parse_selling_protection_response(decrypted)
+            if result is not None:
+                return result
+
+            for _ in range(5):
+                try:
+                    more_resp, _ = self._sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                if self._is_session_expired(more_resp):
+                    break
+                try:
+                    decrypted = decrypt_response(
+                        more_resp, self._creds["chat_secret"],
+                        payload_validator=_is_selling_protection_payload,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                result = parse_selling_protection_response(decrypted)
+                if result is not None:
+                    return result
+
+            return None
+
+    def read_virtualpowerplant(self) -> dict | None:
+        """Read sell-back-to-grid state (0x06) over the existing session.
+
+        Returns a dict with ``sell_back_to_grid_on`` (bool); or *None* on
+        timeout / parse failure.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+
+            req_pkt = build_subscription_packet(
+                self._creds, _VIRTUALPOWERPLANT_GET_TYPE, self._session_nonce,
+            )
+            resp = self._send_raw(req_pkt, "GetVirtualPowerPlant(0x06)")
+            if resp is None:
+                return None
+
+            if self._is_session_expired(resp):
+                return None
+
+            try:
+                decrypted = decrypt_response(
+                    resp, self._creds["chat_secret"],
+                    payload_validator=_is_virtualpowerplant_payload,
+                )
+            except Exception:  # noqa: BLE001
+                decrypted = None
+
+            result = parse_virtualpowerplant_response(decrypted)
+            if result is not None:
+                return result
+
+            for _ in range(5):
+                try:
+                    more_resp, _ = self._sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                if self._is_session_expired(more_resp):
+                    break
+                try:
+                    decrypted = decrypt_response(
+                        more_resp, self._creds["chat_secret"],
+                        payload_validator=_is_virtualpowerplant_payload,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                result = parse_virtualpowerplant_response(decrypted)
+                if result is not None:
+                    return result
+
+            return None
+
+    def read_manual_selling(self) -> dict | None:
+        """Read manual-selling state (0x81) over the existing session.
+
+        Returns a dict with ``enabled`` (bool), ``target_energy_kwh`` (float),
+        ``sold_so_far_kwh`` (float), ``remaining_kwh`` (float); or *None* on
+        timeout / parse failure.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+
+            req_pkt = build_subscription_packet(
+                self._creds, 0x81, self._session_nonce,
+            )
+            resp = self._send_raw(req_pkt, "GetManualSelling(0x81)")
+            if resp is None:
+                return None
+
+            if self._is_session_expired(resp):
+                return None
+
+            try:
+                decrypted = decrypt_response(
+                    resp, self._creds["chat_secret"],
+                    payload_validator=lambda b: len(b) >= 10,
+                )
+            except Exception:  # noqa: BLE001
+                decrypted = None
+
+            result = parse_manual_selling_response(decrypted)
+            if result is not None:
+                return result
+
+            for _ in range(5):
+                try:
+                    more_resp, _ = self._sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                if self._is_session_expired(more_resp):
+                    break
+                try:
+                    decrypted = decrypt_response(
+                        more_resp, self._creds["chat_secret"],
+                        payload_validator=lambda b: len(b) >= 10,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                result = parse_manual_selling_response(decrypted)
+                if result is not None:
+                    return result
+
+            return None
+
+    def read_battery_info(self) -> list[dict]:
+        """Read per-module battery info (type 0x06) over the existing session.
+
+        Probes all known cabinet slot indices. Empty slots return short replies
+        cheaply, so they do not stop discovery; only consecutive *timeouts*
+        abort the scan because each timeout costs the full socket timeout.
+
+        Returns:
+            List of battery-info dicts (one per module), possibly empty.
+            Each dict contains: ``soc``, ``soh``, ``serial``, ``model``,
+            ``index``, ``cabinet_index``, ``cabinet_position``,
+            ``bms_temp_c``, ``electrode_a_temp_c``, ``electrode_b_temp_c``,
+            ``voltage_v``, ``current_a``, ``current_energy_wh``,
+            ``full_energy_wh``, ``cycle_count``, ``capacity``.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+
+            batteries: list[dict] = []
+            seen_serials: set[str] = set()
+
+            TIERS = [(0, 3), (3, 5), (8, 5)]
+
+            prev_timeout = self._sock.gettimeout()
+            self._sock.settimeout(max(prev_timeout, 3.0))
+            if self._log:
+                self._log(
+                    "BatteryInfo scan start: tiers=%s timeout=%.1fs"
+                    % (TIERS, self._sock.gettimeout() or 0.0)
+                )
+            try:
+                for tier_start, tier_size in TIERS:
+                    found_in_tier = 0
+                    consecutive_timeouts = 0
+                    if self._log:
+                        self._log(
+                            f"BatteryInfo tier start: indices={tier_start}-{tier_start + tier_size - 1}"
+                        )
+                    for idx in range(tier_start, tier_start + tier_size):
+                        if self._log:
+                            self._log(f"BatteryInfo(idx={idx}): probing")
+                        req_pkt = build_subscription_packet(
+                            self._creds, 0x06, self._session_nonce,
+                            payload=bytes([idx]),
+                            request_mode=True,
+                        )
+                        resp = self._send_raw(req_pkt, f"BatteryInfo(idx={idx})")
+                        if resp is None:
+                            # True timeout — device not responding.
+                            consecutive_timeouts += 1
+                            if self._log:
+                                self._log(
+                                    f"BatteryInfo(idx={idx}): timeout "
+                                    f"(consecutive={consecutive_timeouts})"
+                                )
+                            if consecutive_timeouts >= 2:
+                                if self._log:
+                                    self._log(
+                                        "BatteryInfo scan aborting after consecutive timeouts; "
+                                        f"modules={len(batteries)} serials={list(seen_serials)}"
+                                    )
+                                return batteries
+                            continue
+
+                        consecutive_timeouts = 0
+                        if self._log:
+                            self._log(f"BatteryInfo(idx={idx}): response {len(resp)}B")
+
+                        # Responses shorter than the AES framing overhead (~50 B)
+                        # cannot contain a valid encrypted payload — skip them.
+                        # Previously used 250 B which silently discarded valid
+                        # HP5000 battery responses (~243 B, #23).
+                        if len(resp) < 50:
+                            if self._log:
+                                self._log(f"BatteryInfo(idx={idx}): too-short {len(resp)}B — skipped")
+                            continue
+
+                        info = self._try_parse_battery(resp)
+                        if info is None:
+                            # First packet may be a subscription ACK — try one more.
+                            try:
+                                extra, _ = self._sock.recvfrom(4096)
+                                if self._log:
+                                    self._log(f"BatteryInfo(idx={idx}) follow-up: {len(extra)}B")
+                                info = self._try_parse_battery(extra)
+                            except socket.timeout:
+                                if self._log:
+                                    self._log(f"BatteryInfo(idx={idx}) follow-up: timeout")
+
+                        if info is None:
+                            if self._log:
+                                self._log(f"BatteryInfo(idx={idx}): parse failed")
+                            continue
+
+                        serial = info.get("serial") or ""
+                        if serial in seen_serials:
+                            if self._log:
+                                self._log(
+                                    f"BatteryInfo(idx={idx}): duplicate serial {serial!r}; skipped"
+                                )
+                            continue
+
+                        seen_serials.add(serial)
+                        info["scan_index"] = idx
+                        batteries.append(info)
+                        found_in_tier += 1
+                        if self._log:
+                            self._log(
+                                "BatteryInfo(idx=%s): parsed serial=%r model=%r "
+                                "payload_index=%s cabinet_index=%s cabinet_position=%s soc=%s"
+                                % (
+                                    idx,
+                                    serial,
+                                    info.get("model"),
+                                    info.get("index"),
+                                    info.get("cabinet_index"),
+                                    info.get("cabinet_position"),
+                                    info.get("soc"),
+                                )
+                            )
+
+                    if self._log:
+                        self._log(
+                            f"BatteryInfo tier complete: indices={tier_start}-{tier_start + tier_size - 1} "
+                            f"found={found_in_tier}/{tier_size}"
+                        )
+            finally:
+                self._sock.settimeout(prev_timeout)
+
+            if self._log:
+                self._log(
+                    f"BatteryInfo scan complete: modules={len(batteries)} serials={list(seen_serials)}"
+                )
+            return batteries
+
+    def _try_parse_battery(self, resp: bytes) -> dict | None:
+        """Decrypt+parse a response as a battery-info payload. Returns None on mismatch."""
+        try:
+            decrypted = decrypt_response(
+                resp, self._creds["chat_secret"],
+                accepted_headers={HEADER_BATTERY},
+            )
+        except Exception:  # noqa: BLE001 - best-effort parse
+            return None
+        return parse_battery_data(decrypted)
+
+    def send_command(self, msg_type: int, payload: bytes) -> bytes | None:
+        """Send a single write command over the existing session socket.
+
+        Uses the session's established nonce and socket so the relay sees the
+        command on the same connection it already knows about.  This avoids the
+        session-conflict that arises when ``_run_session`` opens a competing
+        second socket while the persistent session is active.
+
+        Args:
+            msg_type: E2E message type byte (e.g. 0x38 for SET_THIRDPARTYPV_ON).
+            payload:  Raw command payload bytes.
+
+        Returns:
+            The relay's response bytes, or *None* on timeout / closed session.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+            pkt = build_subscription_packet(
+                self._creds, msg_type, self._session_nonce, payload=payload,
+            )
+            return self._send_raw(pkt, f"Command(0x{msg_type:02x})")
+
     def close(self) -> None:
         """Close the socket and mark the session closed."""
-        self._closed = True
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._sock = None
+        with self._lock:
+            self._closed = True
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._sock = None
 
     def _send_raw(self, pkt: bytes, label: str) -> bytes | None:
         """Send a packet and read one response (no reconnect logic)."""
         if self._sock is None or self._addr is None:
             return None
         self._sock.sendto(pkt, self._addr)
+        started = time.perf_counter()
         try:
             resp, _ = self._sock.recvfrom(4096)
+            self._last_rtt_ms = (time.perf_counter() - started) * 1000.0
             if self._log:
-                self._log(f"{label}: sent {len(pkt)}B → got {len(resp)}B")
+                self._log(
+                    f"{label}: sent {len(pkt)}B → got {len(resp)}B "
+                    f"(rtt={self._last_rtt_ms:.1f}ms)"
+                )
             return resp
         except socket.timeout:
             if self._log:
@@ -2342,7 +3572,11 @@ class PersistentE2ESession:
             return None
 
     def _reconnect(self) -> None:
-        """Close and re-open the session (used on 21204 or timeout)."""
+        """Close and re-open the session socket and re-run the handshake.
+
+        Raises whatever ``_do_handshake`` raises on failure (caller decides
+        whether to suppress).  Generates a fresh session nonce.
+        """
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -2355,6 +3589,44 @@ class PersistentE2ESession:
         self._sock.settimeout(self._timeout)
         self._session_nonce = generate_nonce()
         self._do_handshake()
+
+    def _reconnect_after_expiry(self) -> bool:
+        """Re-handshake after a 21204 (session expired), honoring backoff.
+
+        Returns *True* if the new handshake completed, *False* if it failed
+        or the session has been closed concurrently.  Must be called while
+        already holding ``self._lock``.
+        """
+        if self._closed:
+            return False
+        reconnect_started = time.perf_counter()
+        expiry_age_ms = self._age_ms(self._last_21204_monotonic, reconnect_started)
+        if self._log:
+            self._log(
+                "Session expired (21204) "
+                f"stage={self._last_21204_stage or 'unknown'} "
+                f"age_since_21204={expiry_age_ms} — reconnecting after "
+                f"{self.RECONNECT_BACKOFF_SECONDS:.1f}s backoff"
+            )
+        time.sleep(self.RECONNECT_BACKOFF_SECONDS)
+        try:
+            self._reconnect()
+            if self._log:
+                elapsed_ms = (time.perf_counter() - reconnect_started) * 1000.0
+                self._log(f"Reconnect after 21204 completed in {elapsed_ms:.1f}ms")
+            return True
+        except Exception as err:  # noqa: BLE001 - best-effort reconnect
+            if self._log:
+                self._log(f"Reconnect failed: {err}")
+            return False
+
+    @staticmethod
+    def _age_ms(event_ts: float | None, now_ts: float) -> str:
+        """Format age from event timestamp to ``now_ts`` for debug logs."""
+        if event_ts is None:
+            return "n/a"
+        return f"{(now_ts - event_ts) * 1000.0:.1f}ms"
+
 
     @classmethod
     def _is_session_expired(cls, resp: bytes) -> bool:

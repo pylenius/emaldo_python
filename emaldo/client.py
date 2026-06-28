@@ -15,7 +15,9 @@ Usage::
 """
 
 import json
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import requests
@@ -33,14 +35,22 @@ from .const import (
     DP_HOST,
     SLOT_NO_OVERRIDE,
     get_app_id,
+    get_app_secret,
     get_default_app_version,
 )
-from .crypto import decrypt_response, encrypt_field, make_gmtime
+from .crypto import (
+    decrypt_response_with_secret,
+    encrypt_field_with_secret,
+    make_gmtime,
+)
 from .exceptions import (
     EmaldoAPIError,
     EmaldoAuthError,
     EmaldoConnectionError,
     EmaldoE2EError,
+    EmaldoE2EDecryptError,
+    EmaldoE2EProtocolError,
+    EmaldoE2ESessionExpired,
 )
 from . import e2e as _e2e
 
@@ -61,6 +71,16 @@ def _short_error(exc: Exception) -> str:
     return msg[:200]
 
 
+@dataclass
+class E2ECredentialCacheEntry:
+    """Cached E2E credentials for one home/device/model tuple."""
+
+    creds: dict
+    created_at: float
+    last_used_at: float
+    generation: int = 0
+
+
 class EmaldoClient:
     """Client for the Emaldo battery system API.
 
@@ -79,18 +99,41 @@ class EmaldoClient:
         self,
         session: dict | None = None,
         *,
+        app_id: str = None,
+        app_secret: str | bytes | None = None,
         app_version: str = None,
     ):
         self._session: dict = session or {}
+        self._app_id = app_id if app_id is not None else get_app_id()
+        resolved_secret = app_secret if app_secret is not None else get_app_secret()
+        self._app_secret = (
+            resolved_secret.encode("utf-8")
+            if isinstance(resolved_secret, str)
+            else resolved_secret
+        )
         self._app_version = app_version if app_version is not None else get_default_app_version()
         self._http = requests.Session()
-        # Retry transient connection / SSL errors automatically.
-        retry = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[502, 503, 504],
-            allowed_methods=["POST", "GET"],
-        )
+        # Retry only on transient HTTP errors (502/503/504), not on
+        # read timeouts or connection failures — those block the executor
+        # thread for up to total*timeout seconds if retried.
+        retry_kwargs = {
+            "total": 3,
+            "backoff_factor": 0.5,
+            "status_forcelist": [502, 503, 504],
+            "allowed_methods": ["POST", "GET"],
+            "read": 0,
+            "connect": 0,
+            # Do not retry opaque transport/protocol errors (including TLS EOF)
+            # here. The coordinator already performs one explicit retry with a
+            # client reset, which is easier to reason about and less noisy.
+            "other": 0,
+        }
+        try:
+            retry = Retry(**retry_kwargs)
+        except TypeError:
+            # Backward compatibility for urllib3 versions without "other".
+            retry_kwargs.pop("other", None)
+            retry = Retry(**retry_kwargs)
         adapter = HTTPAdapter(max_retries=retry)
         self._http.mount("https://", adapter)
         self._http.mount("http://", adapter)
@@ -101,6 +144,19 @@ class EmaldoClient:
             "User-Agent": "okhttp/4.9.0",
             "Accept-Encoding": "gzip",
         })
+
+        # -- E2E concurrency + credential caching --
+        # A re-entrant per-device lock serializes all E2E operations against a
+        # single device, preventing competing UDP sessions and lost-update
+        # races in read-modify-write override flows. RLock (not Lock) so a
+        # service that holds the device lock can call get_overrides()/
+        # set_override() — which acquire the same lock — without deadlocking.
+        self._e2e_lock = threading.RLock()
+        self._e2e_device_locks: dict[tuple[str, str, str], threading.RLock] = {}
+        self._e2e_creds_cache: dict[tuple[str, str, str], E2ECredentialCacheEntry] = {}
+        # Cache E2E login credentials to avoid the 3 REST round-trips that
+        # e2e_login() performs on every single E2E operation.
+        self._e2e_credential_ttl = 10 * 60  # seconds; tune after field testing
 
     # ------------------------------------------------------------------
     # Session management
@@ -152,21 +208,23 @@ class EmaldoClient:
             EmaldoAPIError: API returned a non-success status.
         """
         base, host = self._get_base_url(path)
-        url = f"{base}{path}{get_app_id()}"
+        url = f"{base}{path}{self._app_id}"
 
         form_data: dict[str, str] = {}
 
         if json_data is not None:
             json_data["gmtime"] = make_gmtime()
             json_str = json.dumps(json_data, separators=(",", ":"))
-            form_data["json"] = encrypt_field(json_str)
+            form_data["json"] = encrypt_field_with_secret(self._app_secret, json_str)
 
         if need_token:
             token = self._session.get("token", "")
             if not token:
                 raise EmaldoAuthError("Not logged in. Call login() first.")
             token_with_ts = f"{token}_{make_gmtime()}"
-            form_data["token"] = encrypt_field(token_with_ts)
+            form_data["token"] = encrypt_field_with_secret(
+                self._app_secret, token_with_ts
+            )
 
         form_data["gm"] = "1"
 
@@ -214,7 +272,9 @@ class EmaldoClient:
         result_hex = resp_json.get("Result", "")
         if result_hex and isinstance(result_hex, str):
             try:
-                decrypted = decrypt_response(result_hex)
+                decrypted = decrypt_response_with_secret(
+                    self._app_secret, result_hex
+                )
                 resp_json["Result"] = json.loads(decrypted)
             except Exception as exc:
                 resp_json["Result"] = f"[Decryption failed: {exc}]"
@@ -454,16 +514,20 @@ class EmaldoClient:
             "/bmt/stats/battery-v2/day/",
             json_data={**base, "offset": 0},
         )
-        r_dual = self.api_request(
-            "/bmt/is-dual-power-open/",
-            json_data={"home_id": home_id, "bmt_id": device_id},
-        )
+        try:
+            r_dual = self.api_request(
+                "/bmt/is-dual-power-open/",
+                json_data={"home_id": home_id, "bmt_id": device_id},
+            )
+            dual_power: dict | None = r_dual.get("Result") or {}
+        except Exception:
+            dual_power = None  # best-effort; coordinator logs if persistent
 
         return {
             "sensor": r_sensor.get("Result") or {},
             "power_level": r_level.get("Result") or {},
             "battery": r_bat.get("Result") or {},
-            "dual_power": r_dual.get("Result") or {},
+            "dual_power": dual_power,
         }
 
     def get_usage(
@@ -559,16 +623,20 @@ class EmaldoClient:
             "/bmt/stats/grid/day/",
             json_data={**base, "get_real": True, "query_interval": 5},
         )
-        r_dual = self.api_request(
-            "/bmt/is-dual-power-open/",
-            json_data={"home_id": home_id, "bmt_id": device_id},
-        )
+        try:
+            r_dual = self.api_request(
+                "/bmt/is-dual-power-open/",
+                json_data={"home_id": home_id, "bmt_id": device_id},
+            )
+            dual_power: dict | None = r_dual.get("Result") or {}
+        except Exception:
+            dual_power = None  # best-effort; coordinator logs if persistent
 
         return {
             "usage": r_usage.get("Result") or {},
             "battery": r_bat.get("Result") or {},
             "grid": r_grid.get("Result") or {},
-            "dual_power": r_dual.get("Result") or {},
+            "dual_power": dual_power,
         }
 
     def get_solar(
@@ -714,7 +782,106 @@ class EmaldoClient:
             "home_end_secret": home_data.get("end_secret", ""),
             "home_chat_secret": home_data.get("chat_secret", ""),
             "host": device_e2e.get("host", f"{DEFAULT_E2E_HOST}:{DEFAULT_E2E_PORT}"),
+            # Included so e2e commands that require user authorisation (e.g.
+            # set_virtualpowerplant / 0x05) can embed the account user-id in
+            # their payload.
+            "user_id": self._session.get("user_id", "") if self._session else "",
         }
+
+    # ------------------------------------------------------------------
+    # E2E concurrency + credential cache helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _e2e_key(home_id: str, device_id: str, model: str) -> tuple[str, str, str]:
+        return home_id, device_id, model
+
+    def e2e_device_lock(
+        self, home_id: str, device_id: str, model: str
+    ) -> "threading.RLock":
+        """Return a re-entrant lock guarding all E2E operations for one device.
+
+        Hold this around a read-modify-write override transaction so the read
+        and the subsequent write cannot interleave with another writer.
+        """
+        key = self._e2e_key(home_id, device_id, model)
+        with self._e2e_lock:
+            lock = self._e2e_device_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._e2e_device_locks[key] = lock
+            return lock
+
+    def invalidate_e2e_session(
+        self, home_id: str, device_id: str, model: str
+    ) -> None:
+        """Drop cached E2E credentials for one device (forces re-login)."""
+        key = self._e2e_key(home_id, device_id, model)
+        with self._e2e_lock:
+            self._e2e_creds_cache.pop(key, None)
+
+    def _get_e2e_credentials(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict:
+        """Return cached E2E credentials, refreshing them when needed."""
+        key = self._e2e_key(home_id, device_id, model)
+        now = time.monotonic()
+
+        with self._e2e_lock:
+            entry = self._e2e_creds_cache.get(key)
+            expired = (
+                entry is None
+                or now - entry.created_at > self._e2e_credential_ttl
+            )
+
+            if force_refresh or expired:
+                creds = self.e2e_login(home_id, device_id, model)
+                generation = entry.generation + 1 if entry else 1
+                entry = E2ECredentialCacheEntry(
+                    creds=creds,
+                    created_at=now,
+                    last_used_at=now,
+                    generation=generation,
+                )
+                self._e2e_creds_cache[key] = entry
+            else:
+                entry.last_used_at = now
+
+            return dict(entry.creds)
+
+    def _run_e2e_with_refresh_retry(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        operation: Callable[[dict], Any],
+    ) -> Any:
+        """Run an E2E operation under the device lock with one refresh-retry.
+
+        On a session/protocol/decrypt failure the cached credentials are
+        invalidated and the operation is retried once with fresh credentials.
+        Reads and idempotent writes are safe to retry this way.
+        """
+        lock = self.e2e_device_lock(home_id, device_id, model)
+        with lock:
+            creds = self._get_e2e_credentials(home_id, device_id, model)
+            try:
+                return operation(creds)
+            except (
+                EmaldoE2ESessionExpired,
+                EmaldoE2EDecryptError,
+                EmaldoE2EProtocolError,
+            ):
+                self.invalidate_e2e_session(home_id, device_id, model)
+                refreshed = self._get_e2e_credentials(
+                    home_id, device_id, model, force_refresh=True
+                )
+                return operation(refreshed)
 
     def get_overrides(
         self,
@@ -729,8 +896,10 @@ class EmaldoClient:
         Returns a dict with ``slots`` (96 ints), ``high_marker``,
         and ``low_marker``; or *None* if reading fails.
         """
-        creds = self.e2e_login(home_id, device_id, model)
-        return _e2e.read_overrides(creds, log=log)
+        return self._run_e2e_with_refresh_retry(
+            home_id, device_id, model,
+            lambda creds: _e2e.read_overrides(creds, log=log),
+        )
 
     def get_battery_info(
         self,
@@ -759,6 +928,18 @@ class EmaldoClient:
         creds = self.e2e_login(home_id, device_id, model)
         return _e2e.read_power_flow(creds, log=log)
 
+    def get_regulate_frequency_state(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read FCR/mFRR grid frequency regulation state via E2E (type 0x45)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.read_regulate_frequency_state(creds, log=log)
+
     def set_override(
         self,
         home_id: str,
@@ -768,6 +949,7 @@ class EmaldoClient:
         *,
         high_marker: int = DEFAULT_MARKER_HIGH,
         low_marker: int = DEFAULT_MARKER_LOW,
+        battery_range_override: bool = False,
         log: Callable[..., None] | None = None,
     ) -> bool:
         """Send override values to the device.
@@ -783,6 +965,9 @@ class EmaldoClient:
             slot_values: 96 bytes of override values.
             high_marker: High battery marker percentage.
             low_marker: Low battery marker percentage.
+            battery_range_override: When ``True`` activates the app's
+                "Battery Range = override" mode (byte 2 of payload). Default
+                ``False`` leaves the AI Battery Range setting unchanged.
             log: Optional log callback ``log(message: str)``.
 
         Returns:
@@ -790,10 +975,13 @@ class EmaldoClient:
         """
         if len(slot_values) not in (96, 192):
             raise ValueError(f"Expected 96 or 192 slot bytes, got {len(slot_values)}")
-        creds = self.e2e_login(home_id, device_id, model)
-        return _e2e.send_override(
-            creds, slot_values,
-            high_marker=high_marker, low_marker=low_marker, log=log,
+        return self._run_e2e_with_refresh_retry(
+            home_id, device_id, model,
+            lambda creds: _e2e.send_override(
+                creds, slot_values,
+                high_marker=high_marker, low_marker=low_marker,
+                battery_range_override=battery_range_override, log=log,
+            ),
         )
 
     def reset_overrides(
@@ -804,13 +992,45 @@ class EmaldoClient:
         *,
         high_marker: int = DEFAULT_MARKER_HIGH,
         low_marker: int = DEFAULT_MARKER_LOW,
+        battery_range_override: bool = False,
         log: Callable[..., None] | None = None,
     ) -> bool:
         """Clear all overrides (all slots → follow base schedule)."""
         slot_values = bytes([SLOT_NO_OVERRIDE] * 96)
         return self.set_override(
             home_id, device_id, model, slot_values,
-            high_marker=high_marker, low_marker=low_marker, log=log,
+            high_marker=high_marker, low_marker=low_marker,
+            battery_range_override=battery_range_override, log=log,
+        )
+
+    def set_battery_range(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        smart_pct: int,
+        emergency_pct: int,
+        enable: bool = True,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Write the AI Battery Range — opcode 0x1AA0 with `enable` byte.
+
+        Mirrors the app's "Save Battery Range" button: sends the new
+        smart/emergency markers with all 96 per-slot overrides cleared to
+        ``SLOT_NO_OVERRIDE`` (0x80). ``enable=True`` activates
+        "Battery Range = override" — AI must operate inside
+        [emergency_pct, smart_pct]. ``enable=False`` reverts to AI-chosen
+        range while persisting the markers.
+        """
+        if not (0 <= smart_pct <= 100 and 0 <= emergency_pct <= 100):
+            raise ValueError("smart_pct and emergency_pct must be 0..100")
+        if smart_pct < emergency_pct:
+            raise ValueError("smart_pct must be >= emergency_pct")
+        return self.reset_overrides(
+            home_id, device_id, model,
+            high_marker=smart_pct, low_marker=emergency_pct,
+            battery_range_override=enable, log=log,
         )
 
     # ── Sell (discharge-to-grid) ──────────────────────────────────────
@@ -868,6 +1088,29 @@ class EmaldoClient:
         return self.send_sell(
             home_id, device_id, model, duration_seconds,
             label="Emergency charge", log=log,
+        )
+
+    def emergency_charge_window(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        start_unix: int,
+        end_unix: int,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Start emergency charge for a specific time window.
+
+        Args:
+            start_unix: Window start as a Unix timestamp.
+            end_unix:   Window end as a Unix timestamp.
+        """
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.set_emergency_charge(
+            creds, on=True,
+            start_unix=start_unix, end_unix=end_unix,
+            log=log,
         )
 
     def emergency_charge_off(
@@ -965,3 +1208,115 @@ class EmaldoClient:
         """Set peak shaving redundancy value."""
         creds = self.e2e_login(home_id, device_id, model)
         return _e2e.set_peak_shaving_redundancy(creds, redundancy, log=log)
+
+    def set_third_party_pv(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        enabled: bool,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Enable or disable third-party PV input."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.set_thirdparty_pv(creds, enabled, log=log)
+
+    def set_selling_protection(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        enabled: bool,
+        threshold_w: int = 0,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Enable/disable selling protection (grid-export cap, 0x5E)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.set_selling_protection(creds, enabled, threshold_w, log=log)
+
+    def get_selling_protection(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read selling-protection state (0x5F)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.get_selling_protection(creds, log=log)
+
+    def set_virtualpowerplant(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        enabled: bool,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Set sell-back-to-grid (VPP) state (0x05). Sends user_id for auth."""
+        creds = self.e2e_login(home_id, device_id, model)
+        user_id = creds.get("user_id", "")
+        return _e2e.set_virtualpowerplant(creds, enabled, user_id=user_id, log=log)
+
+    def get_virtualpowerplant(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read sell-back-to-grid state (0x06)."""
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.get_virtualpowerplant(creds, log=log)
+
+    # ── Manual selling (0x80 / 0x81) ─────────────────────────────────
+
+    def set_manual_selling(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        on: bool,
+        target_energy_kwh: int | float = 0,
+        *,
+        expand: bool = False,
+        log: Callable[..., None] | None = None,
+    ) -> bool:
+        """Start or stop manual grid-export (selling) with a kWh target.
+
+        Args:
+            on: ``True`` to start selling, ``False`` to stop.
+            target_energy_kwh: Total kWh to sell before stopping (required
+                when *on* is ``True``).
+            expand: Set the ``isExpandSelling`` flag in the payload.
+            log: Optional log callback.
+
+        Returns:
+            ``True`` if the device acknowledged the command.
+        """
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.set_manual_selling(
+            creds, on, target_energy_kwh, expand=expand, log=log,
+        )
+
+    def get_manual_selling(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        log: Callable[..., None] | None = None,
+    ) -> dict | None:
+        """Read current manual-selling state and energy counters (0x81).
+
+        Returns a dict with ``enabled``, ``first_use``,
+        ``target_energy_kwh``, ``sold_so_far_kwh``, and
+        ``remaining_kwh``; or *None* if the device did not respond.
+        """
+        creds = self.e2e_login(home_id, device_id, model)
+        return _e2e.get_manual_selling(creds, log=log)

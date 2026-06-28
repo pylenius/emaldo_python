@@ -28,6 +28,13 @@ this implementation.
 - **Sell to grid** — Manual sell (discharge-to-grid) command via E2E
 - **Emergency charge** — Force-charge the battery via E2E
 - **Peak shaving** — Full peak shaving control via E2E (toggle, reserves, schedule, all-day, redundancy)
+- **Grid frequency regulation** — Read FCR/mFRR balancing state via E2E
+- **Realtime power flow** — Battery/solar/grid/load watts via E2E (`get_power_flow` 0x30)
+- **Persistent E2E session** — `PersistentE2ESession` keeps one UDP socket open for fast, low-latency polling with background keepalive and automatic 21204 recovery
+- **Third-party PV control** — Enable/disable third-party PV routing via E2E
+- **Sell Back to Grid** — Enable/disable VPP grid export via E2E (`set_virtualpowerplant` 0x05)
+- **Sell Limit** — Read/write daily grid-export cap in kWh/day via E2E (`set_sellingprotection` 0x5E)
+- **Manual selling** — Start/stop direct grid-export with a target kWh via E2E (`set_manual_selling` 0x80 / `get_manual_selling` 0x81)
 - **Usage analytics** — Solar, grid, battery, and revenue data
 
 ## Installation
@@ -120,6 +127,7 @@ emaldo schedule
 emaldo power
 
 # Solar generation (--offset N for past days)
+# Shows the daily total plus a per-MPPT-string (1/2/3) breakdown
 emaldo solar
 
 # Grid import/export
@@ -154,10 +162,16 @@ emaldo sell --hours 2
 emaldo sell --until 18:00
 emaldo sell --cancel
 
-# Emergency charge for 1 hour
+# Emergency charge for 1 hour (starts immediately)
 emaldo emergency-charge --hours 1
 emaldo emergency-charge --until 06:00
 emaldo emergency-charge --cancel
+
+# Emergency charge with explicit start/end window
+emaldo emergency-charge --start 23:00 --until 06:00
+emaldo emergency-charge --start 02:00 --hours 4
+emaldo emergency-charge --start "2026-05-20 23:00" --until "2026-05-21 06:00"
+emaldo emergency-charge --start 23:00 --until 06:00 --dry-run
 
 # Peak shaving
 emaldo peak-shaving                                              # Show current state
@@ -168,6 +182,31 @@ emaldo peak-shaving --schedule 06:00-22:00 5000 Mon,Wed,Fri      # Set schedule
 emaldo peak-shaving --schedule 06:00-22:00 5000 Mon-Fri --all-day  # All-day mode
 emaldo peak-shaving --no-all-day                                 # Disable all-day
 emaldo peak-shaving --redundancy 1                               # Set redundancy
+
+# Third-party PV
+emaldo third-party-pv --on
+emaldo third-party-pv --off
+
+# Sell Back to Grid (VPP – requires account user_id for auth)
+emaldo sell-back-to-grid               # Read current state
+emaldo sell-back-to-grid --on
+emaldo sell-back-to-grid --off
+
+# Manual selling (direct E2E grid-export up to a target kWh)
+emaldo manual-selling                  # Read current state
+emaldo manual-selling --on --target 5  # Sell up to 5 kWh
+emaldo manual-selling --off            # Stop manual selling
+emaldo manual-selling --json           # Raw JSON output
+
+# Sell Limit (daily grid-export cap)
+emaldo sell-limit                      # Read current state (on/off + kWh/day threshold)
+emaldo sell-limit --on --threshold 300 # Enable with 300 kWh/day cap
+emaldo sell-limit --on --threshold 50  # Enable with 50 kWh/day cap
+emaldo sell-limit --off                # Disable (threshold is remembered by device)
+
+# Grid frequency regulation (balancing) state
+emaldo balancing-state                  # Show current state (idle/pre_balancing/fcr_n/fcr_d_up/fcr_d_down/fcr_d_up_down/mfrr_up/mfrr_down/balancing_failed)
+emaldo balancing-state --json           # Raw JSON output
 ```
 
 ### Library
@@ -219,6 +258,52 @@ client.set_override(home_id, device_id, model, bytes(slot_values),
 client.reset_overrides(home_id, device_id, model)
 ```
 
+### Realtime Power Flow
+
+A one-shot reading opens a fresh UDP socket and runs the full handshake on every
+call:
+
+```python
+flow = client.get_power_flow(home_id, device_id, model)
+print(flow["battery_w"], flow["solar_w"], flow["grid_w"])
+```
+
+For continuous monitoring use `PersistentE2ESession`, which handshakes once,
+keeps a single socket open, and re-uses it for each read. Send a keepalive every
+~7 seconds (the relay drops idle sessions after ~10 s); the session automatically
+re-handshakes in place if the relay reports a 21204 (session expired):
+
+```python
+import threading, time
+from emaldo.e2e import PersistentE2ESession
+
+creds = client.e2e_login(home_id, device_id, model)
+session = PersistentE2ESession(creds)
+session.connect()
+
+def _keepalive_loop():
+    while not session.closed:
+        time.sleep(session.DEFAULT_KEEPALIVE_INTERVAL)  # 7 s
+        session.keepalive()
+
+threading.Thread(target=_keepalive_loop, daemon=True).start()
+
+try:
+    while True:
+        data = session.read_power_flow()   # fast — reuses the socket
+        if data:
+            print(data["battery_w"], data["solar_w"], data["grid_w"])
+        # diagnostics
+        print("RTT:", session.last_rtt_ms, "ms")
+        time.sleep(5)
+finally:
+    session.close()
+```
+
+Diagnostic properties available on a live session: `last_rtt_ms` (last UDP
+round-trip), `last_keepalive_failure_reason`, and `last_power_flow_diag` (per-read
+counters for timeouts, session-expired hits, and drained packets).
+
 ### Session Persistence
 
 
@@ -263,18 +348,26 @@ client = EmaldoClient(session=session)
 | `get_grid(home_id, device_id, model, offset)` | Grid import/export |
 | `get_strategy(home_id, device_id, model)` | Composite AI strategy view |
 | `get_battery_info(home_id, device_id, model)` | Per-cell battery data via E2E |
+| `get_power_flow(home_id, device_id, model)` | Realtime power flow (battery/solar/grid/load W) via E2E (0x30) |
 | `get_overrides(home_id, device_id, model)` | Read override state (slots + markers) |
 | `set_override(home_id, ..., slots, high_marker, low_marker)` | Set override values + markers |
 | `reset_overrides(home_id, ..., high_marker, low_marker)` | Clear overrides (optionally set markers) |
 | `send_sell(home_id, device_id, model, duration_seconds)` | Sell (discharge-to-grid) for N seconds |
 | `cancel_sell(home_id, device_id, model)` | Cancel active sell command |
-| `emergency_charge_on(home_id, device_id, model, duration_seconds)` | Emergency charge for N seconds |
+| `emergency_charge_on(home_id, device_id, model, duration_seconds)` | Emergency charge for N seconds (starts immediately) |
+| `emergency_charge_window(home_id, device_id, model, start_unix, end_unix)` | Emergency charge for an explicit time window (Unix timestamps) |
 | `emergency_charge_off(home_id, device_id, model)` | Cancel emergency charge |
 | `get_peak_shaving(home_id, device_id, model)` | Read peak shaving config & schedule via E2E |
 | `toggle_peak_shaving(home_id, ..., enabled)` | Enable/disable peak shaving |
 | `set_peak_shaving_points(home_id, ..., peak_pct, ups_pct)` | Set peak/UPS reserve percentages |
 | `set_peak_shaving_schedule(home_id, ..., id, start, end, days, power, all_day)` | Set peak shaving schedule |
 | `set_peak_shaving_redundancy(home_id, ..., redundancy)` | Set redundancy value |
+| `get_regulate_frequency_state(home_id, device_id, model)` | Read grid frequency regulation (balancing) state via E2E |
+| `set_third_party_pv(home_id, device_id, model, enabled)` | Enable/disable third-party PV routing (0x41) |
+| `set_selling_protection(home_id, device_id, model, enabled, threshold_kwh)` | Enable/disable daily export cap; threshold in kWh/day (0x5E) |
+| `get_selling_protection(home_id, device_id, model)` | Read selling-protection state: `{selling_protection_on, threshold_kwh}` (0x5F) |
+| `set_virtualpowerplant(home_id, device_id, model, enabled)` | Enable/disable sell-back-to-grid (0x05); sends user_id for auth |
+| `get_virtualpowerplant(home_id, device_id, model)` | Read sell-back-to-grid state: `{sell_back_to_grid_on}` (0x06) |
 | `get_region(home_id, device_id, model)` | Device region info |
 | `get_contract(home_id)` | Balance contract info |
 | `get_features(home_id, device_id, model)` | Device feature flags |
@@ -329,7 +422,11 @@ The 7 standard override actions map to slot values using the configured markers 
 | `override` | Override control (`--show`, `--reset`, `--range`, `--markers`) |
 | `sell` | Sell (discharge-to-grid) via E2E (`--hours`, `--until`, `--cancel`) |
 | `emergency-charge` | Emergency charge via E2E (`--hours`, `--until`, `--cancel`) |
+| `third-party-pv` | Enable/disable third-party PV routing via E2E (`--on`, `--off`) |
+| `sell-back-to-grid` | Read/write sell-back-to-grid (VPP) state via E2E (`--read`, `--on`, `--off`) |
+| `sell-limit` | Read/write daily export cap via E2E (`--read`, `--on`, `--off`, `--threshold KWH`) |
 | `peak-shaving` | Peak shaving via E2E (`--show`, `--enable`, `--disable`, `--peak-reserve`, `--ups-reserve`, `--schedule`, `--all-day`, `--no-all-day`, `--redundancy`) |
+| `balancing-state` | Grid frequency regulation (balancing) state via E2E (`--json`, `--verbose`) |
 | `region` | Region info |
 | `contract` | Contract info |
 | `features` | Feature flags |
